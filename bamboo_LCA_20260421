@@ -1,0 +1,3749 @@
+# =========================================================
+# BLOCK 1 — IMPORTS AND RUNTIME CONFIG
+# =========================================================
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field
+from math import exp, log
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+# Runtime switches
+GENERATE_PLOTS = True
+EXPORT_RESULTS = False
+PRINT_SUMMARY_TABLES = True
+SAVE_PLOTS = True
+
+
+# Defaults
+DEFAULT_TIME_HORIZON_YEARS = 100
+DEFAULT_SENSITIVITY_DELTA = 0.20
+ROUND_DIGITS = 3
+
+
+# Paths
+OUTPUT_DIR = Path("outputs")
+FIGURE_DIR = OUTPUT_DIR / "figures"
+TABLE_DIR = OUTPUT_DIR / "tables"
+
+
+# Display / plotting defaults
+PANDAS_OPTIONS = {
+    "display.max_columns": 50,
+    "display.width": 140,
+    "display.max_colwidth": 120,
+    "display.float_format": lambda x: f"{x:.{ROUND_DIGITS}f}",
+}
+
+MATPLOTLIB_DEFAULTS = {
+    # Layout
+    "figure.figsize": (6.5, 4.3),
+    "figure.dpi": 300,
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+
+    # Typography
+    "font.family": "serif",
+    "font.serif": ["Times New Roman"],
+    "font.size": 10.5,
+    "mathtext.fontset": "stix",
+    "axes.unicode_minus": False,
+
+    # Uniform sizing for publication figures
+    "axes.titlesize": 10.5,
+    "axes.labelsize": 10.5,
+    "xtick.labelsize": 10.5,
+    "ytick.labelsize": 10.5,
+    "legend.fontsize": 10.5,
+
+    # Line widths
+    "axes.linewidth": 0.8,
+    "grid.linewidth": 0.5,
+    "lines.linewidth": 1.2,
+    "patch.linewidth": 0.8,
+    "xtick.major.width": 0.8,
+    "ytick.major.width": 0.8,
+    "xtick.minor.width": 0.6,
+    "ytick.minor.width": 0.6,
+    "xtick.major.size": 3.5,
+    "ytick.major.size": 3.5,
+
+    # Legend
+    "legend.frameon": False,
+}
+
+ANNOTATION_FONT_SIZE = 10.5
+TITLE_FONT_SIZE = 10.5
+
+def apply_runtime_defaults() -> None:
+    for k, v in PANDAS_OPTIONS.items():
+        pd.set_option(k, v)
+    plt.rcParams.update(MATPLOTLIB_DEFAULTS)
+
+    if EXPORT_RESULTS or SAVE_PLOTS:
+        for path in (OUTPUT_DIR, FIGURE_DIR, TABLE_DIR):
+            path.mkdir(parents=True, exist_ok=True)
+
+
+apply_runtime_defaults()
+
+# =========================================================
+# BLOCK 2 — MODEL DEFINITIONS
+# =========================================================
+
+@dataclass(frozen=True)
+class ModelConstants:
+    # Functional unit and composition
+    functional_unit_kg: float = 1.0
+    density_kg_per_m3: float = 1080.0
+    bamboo_fraction: float = 0.85
+    resin_fraction: float = 0.15
+    carbon_fraction_bamboo_dry: float = 0.4922
+    co2_to_c_molecular_ratio: float = 44.0 / 12.0
+
+    # Generic transport
+    truck_kgco2e_per_tkm: float = 0.10
+    ship_kgco2e_per_tkm: float = 0.01
+
+    # Stage B1 manufacturing
+    harvesting_kgco2e_per_hr_power_saw: float = 0.274428
+    electricity_kgco2e_per_kwh: float = 0.4974
+    steam_kgco2e_per_kwh: float = 0.4974
+    phenolic_resin_kgco2e_per_kg: float = 3.13
+    lignin_resin_kgco2e_per_kg: float = 2.18
+    harvesting_machine_hours_per_m3: float = 0.39
+    bundle_electricity_kwh_per_m3: float = 866.51
+    final_beam_electricity_kwh_per_m3: float = 145.18
+    bundle_steam_kwh_per_m3: float = 125.16
+    recovery_rate_cp: float = 0.6667
+    recovery_rate_fp: float = 0.98
+    recovery_rate_ep: float = 0.58
+    transport1_distance_km_stage_b: float = 15.0
+    transport2_distance_km_stage_b: float = 300.0
+    transport1_kgco2e_per_tkm_stage_b: float = 0.19846944
+    transport2_kgco2e_per_tkm_stage_b: float = 0.09923472
+
+    # Stage B2 / B3 decarbonization levers
+    pv_substitution_share: float = 0.40
+    ev_small_lorry_kwh_per_km: float = 0.99
+    ev_heavy_lorry_kwh_per_km: float = 1.77
+    small_lorry_payload_t: float = 5.0
+    heavy_lorry_payload_t: float = 10.0
+    charging_loss_factor: float = 1.00
+    lignin_substitution_rate: float = 1.0  # 1.0 = 100% lignin resin, 0.0 = 100% phenolic resin
+
+    # Stage C
+    stage_c_transport1_distance_km: float = 200.0
+    stage_c_transport2_distance_km: float = 1500.0
+    stage_c_transport3_distance_km: float = 15.0
+    stage_c_project_duration_years: float = 1.0
+
+    # Stage C1
+    stage_c1_transport4_distance_km: float = 7.0
+
+    # Stage D1 — Osaka relocation route
+    osaka_expo_to_port_km: float = 10.0
+    osaka_to_haikou_km: float = 2200.0
+    haikou_port_to_site_km: float = 15.0
+    d1_secondary_service_life_years: float = 24.0
+
+    # Stage D2 / D3 — direct Zhejiang → Hainan route
+    d23_truck1_distance_km: float = 1740.0
+    d23_ferry_distance_km: float = 20.0
+    d23_truck2_distance_km: float = 9.0
+    d23_ferry_kgco2e_per_tkm: float = 0.020
+    d2_service_life_years: float = 25.0
+    d2_retention_at_year_25: float = 0.50
+    d3_end_of_service_year: float = 50.0
+    d3_target_retention_fraction_at_year50: float = 0.85
+
+    # D3 Electric Vehicle Transport
+    d3_ev_truck_kwh_per_km: float = 1.77  # Heavy EV truck
+    d3_ev_truck_payload_kg: float = 10000.0  # 10 tonnes
+    zhejiang_grid_kgco2e_per_kwh: float = 0.4974  # Same as electricity_kgco2e_per_kwh
+    d3_ev_charging_loss_factor: float = 1.00
+
+    # Stage E1
+    west_coast_park_to_incinerator_km: float = 30.0
+    hainan_grid_kgco2e_per_kwh: float = 0.3648
+    heavy_lorry_payload_kg_e1: float = 12000.0
+
+    # Stage E2 / E3
+    biochar_retention_e2: float = 0.15
+    biochar_retention_e3: float = 0.70
+
+    # Sensitivity analysis multiplier for total transport emissions
+    transport_emissions_multiplier: float = 1.0
+
+
+C = ModelConstants()
+
+
+def _pathway(
+    label: str,
+    group: str,
+    b_stage: str,
+    use_stage_c: bool,
+    d_stage: Optional[str],
+    end_stage: str,
+    stages: List[str],
+    description: str,
+) -> Dict[str, Any]:
+    return {
+        "label": label,
+        "group": group,
+        "b_stage": b_stage,
+        "use_stage_c": use_stage_c,
+        "d_stage": d_stage,
+        "end_stage": end_stage,
+        "stages": stages,
+        "description": description,
+    }
+
+
+PATHWAY_META: Dict[str, Dict[str, Any]] = {
+    "A-B1-C-C1": _pathway(
+        "Japan disposal",
+        "phase_1",
+        "B1",
+        True,
+        None,
+        "C1",
+        ["A", "B1", "C", "C1"],
+        "Japan disposal after the Osaka use phase.",
+    ),
+    "A-B1-C-D1-E1": _pathway(
+        "Relocation",
+        "phase_1",
+        "B1",
+        True,
+        "D1",
+        "E1",
+        ["A", "B1", "C", "D1", "E1"],
+        "Expo relocation pathway from Osaka to Hainan with incineration end-of-life.",
+    ),
+    "A-B1-D2-E1": _pathway(
+        "Baseline",
+        "phase_2",
+        "B1",
+        False,
+        "D2",
+        "E1",
+        ["A", "B1", "D2", "E1"],
+        "Direct deployment from Zhejiang to Hainan with 25-year service life and E1 incineration.",
+    ),
+
+    "A-B2-D2-E1": _pathway(
+        "Baseline + limited manufacturing",
+        "phase_2",
+        "B2",
+        False,
+        "D2",
+        "E1",
+        ["A", "B2", "D2", "E1"],
+        "Direct deployment with limited manufacturing improvement, 25-year service life, and incineration end-of-life.",
+    ),
+
+    "A-B2-D2-E2": _pathway(
+        "Limited decarbonization",
+        "phase_2",
+        "B2",
+        False,
+        "D2",
+        "E2",
+        ["A", "B2", "D2", "E2"],
+        "Direct deployment with cleaner manufacturing, 25-year service life, and E2 pyrolysis.",
+    ),
+
+    "A-B3-D2-E1": _pathway(
+        "Baseline + maximum manufacturing",
+        "phase_2",
+        "B3",
+        False,
+        "D2",
+        "E1",
+        ["A", "B3", "D2", "E1"],
+        "Direct deployment with maximum manufacturing improvement, 25-year service life, and incineration end-of-life.",
+    ),
+
+    "A-B3-D3-E1": _pathway(
+    "Baseline + maximum manufacturing + service-life improvement",
+        "phase_2",
+        "B3",
+        False,
+        "D3",
+        "E1",
+        ["A", "B3", "D3", "E1"],
+        "Direct deployment with maximum manufacturing improvement, 50-year service life, and incineration end-of-life.",
+    ),
+    
+    "A-B2-D3-E2": _pathway(
+        "Medium decarbonization",
+        "phase_2",
+        "B2",
+        False,
+        "D3",
+        "E2",
+        ["A", "B2", "D3", "E2"],
+        "Direct deployment with cleaner manufacturing, 50-year service life, and E2 pyrolysis.",
+    ),
+    "A-B3-D3-E2": _pathway(
+        "High decarbonization",
+        "phase_2",
+        "B3",
+        False,
+        "D3",
+        "E2",
+        ["A", "B3", "D3", "E2"],
+        "Direct deployment with green inputs, 50-year service life, and E2 pyrolysis.",
+    ),
+    "A-B3-D3-E3": _pathway(
+        "Maximum decarbonization",
+        "phase_2",
+        "B3",
+        False,
+        "D3",
+        "E3",
+        ["A", "B3", "D3", "E3"],
+        "Direct deployment with green inputs, 50-year service life, and high-retention biochar end-of-life.",
+    ),
+}
+
+PATHWAY_ORDER = list(PATHWAY_META)
+STAGE_DISPLAY_ORDER = ["A", "B1", "B2", "B3", "C", "C1", "D1", "D2", "D3", "E1", "E2", "E3"]
+
+BASELINE_PATHWAY_CODE = "A-B1-D2-E1"
+ASPIRATIONAL_PATHWAY_CODE = "A-B3-D3-E3"
+
+
+SENSITIVITY_SPECS = [
+    {"parameter": "Electricity emission factor", "driver": "electricity_ef", "unit": "kg CO2e/kWh", "basis": "absolute_constant"},
+    {"parameter": "Resin fraction", "driver": "resin_fraction", "unit": "mass fraction", "basis": "composition_parameter"},
+    {"parameter": "Manufacturing energy intensity", "driver": "manufacturing_energy_multiplier", "unit": "multiplier", "basis": "linked_stage_b_energy"},
+    {"parameter": "Total transport emissions", "driver": "transport_emissions_multiplier", "unit": "multiplier", "basis": "all_transport_stages"},
+    {"parameter": "Carbon retention at year 25", "driver": "retention_at_year_25", "unit": "fraction retained", "basis": "d2_end_of_life_retention"},
+    {"parameter": "Biochar fraction", "driver": "biochar_fraction", "unit": "retained fraction", "basis": "counterfactual_e2_on_baseline"},
+]
+
+
+SUMMARY_COLS = [
+    "pathway_code", "pathway_label", "initial_biogenic_stock_kgco2e",
+    "total_process_emissions_kgco2e", "total_biogenic_release_kgco2e",
+    "final_retained_stock_kgco2e", "net_carbon_balance_kgco2e", "stage_count", "description",
+]
+
+STAGE_TABLE_COLS = [
+    "stage_code", "stage_label", "start_year", "end_year",
+    "process_emissions_kgco2e", "biogenic_release_kgco2e", "total_stage_impact_kgco2e",
+    "retained_stock_kgco2e", "stock_change_kgco2e", "transport_emissions_kgco2e",
+    "electricity_emissions_kgco2e", "steam_emissions_kgco2e", "resin_emissions_kgco2e",
+    "harvesting_emissions_kgco2e", "notes",
+]
+
+FLOW_COLS = [
+    "pathway_code", "pathway_label", "stage_code", "stage_label",
+    "process_emissions_kgco2e", "biogenic_release_kgco2e", "retained_stock_after_stage_kgco2e",
+]
+
+STAGE_CONTRIBUTION_COLS = [
+    "pathway_code", "pathway_label", "stage_code", "stage_label",
+    "process_emissions_kgco2e", "biogenic_release_kgco2e", "total_stage_impact_kgco2e",
+    "retained_stock_kgco2e", "stock_change_kgco2e",
+]
+
+RETENTION_COLS = [
+    "pathway_code", "pathway_label", "stage_code", "stage_label",
+    "start_year", "end_year", "retained_stock_kgco2e", "stock_change_kgco2e",
+]
+
+GROUP_SUMMARY_COLS = [
+    "group", "scenario", "pathway", "pathway_code", "pathway_label",
+    "initial_biogenic_stock_kgco2e", "total_process_emissions_kgco2e",
+    "total_biogenic_release_kgco2e", "final_retained_stock_kgco2e",
+    "net_carbon_balance_kgco2e", "stage_count", "description",
+]
+
+TEMPORAL_SUMMARY_COLS = [
+    "pathway_code", "pathway_label", "horizon_years", "temporal_storage_benefit_kgco2e_year",
+    "temporal_storage_benefit_tco2e_year", "temporal_storage_benefit_normalised_tco2e",
+    "average_retained_stock_tco2e", "end_of_horizon_retained_stock_tco2e", "stock_trajectory",
+]
+
+TEMPORAL_TRAJECTORY_COLS = [
+    "pathway_code", "pathway_label", "time_year", "stage_label", "retained_stock_kgco2e", "retained_stock_tco2e",
+]
+
+SENSITIVITY_COLS = [
+    "rank", "parameter", "baseline_value", "low_case_value", "high_case_value",
+    "low_ncb_kgco2e", "high_ncb_kgco2e", "low_delta_kgco2e", "high_delta_kgco2e", "impact",
+]
+
+TORNADO_COLS = [
+    "rank", "parameter", "parameter_label", "baseline_value", "low_case_value", "high_case_value",
+    "low_ncb_kgco2e", "high_ncb_kgco2e", "low_delta_kgco2e", "high_delta_kgco2e",
+    "min_delta_kgco2e", "max_delta_kgco2e", "absolute_swing_kgco2e", "impact",
+]
+
+UNCERTAINTY_COLS = ["scenario_group", "scenario", "pathway", "net_carbon_balance_kgco2e", "delta_vs_baseline_kgco2e"]
+
+TIPPING_POINT_COLS = [
+    "rank", "scenario", "pathway", "NCB_relocation",
+    "carbon_negative", "temporal_storage_benefit_tco2e_year", "average_retained_stock_tco2e",
+]
+
+CARBON_NEGATIVITY_COLS = [
+    "pathway_code", "pathway_label", "net_carbon_balance_kgco2e", "carbon_negative", "interpretation_label",
+]
+
+
+@dataclass
+class StageRecord:
+    stage_code: str
+    stage_label: str
+    process_emissions_kgco2e: float = 0.0
+    biogenic_release_kgco2e: float = 0.0
+    retained_stock_kgco2e: float = 0.0
+    stock_change_kgco2e: float = 0.0
+    transport_emissions_kgco2e: float = 0.0
+    electricity_emissions_kgco2e: float = 0.0
+    steam_emissions_kgco2e: float = 0.0
+    resin_emissions_kgco2e: float = 0.0
+    harvesting_emissions_kgco2e: float = 0.0
+    start_year: Optional[float] = None
+    end_year: Optional[float] = None
+    notes: str = ""
+
+    @property
+    def total_stage_impact_kgco2e(self) -> float:
+        return self.process_emissions_kgco2e + self.biogenic_release_kgco2e
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {**asdict(self), "total_stage_impact_kgco2e": self.total_stage_impact_kgco2e}
+
+    def copy_with(self, **updates: Any) -> "StageRecord":
+        return StageRecord(**{**asdict(self), **updates})
+
+
+@dataclass
+class PathwayResult:
+    pathway_code: str
+    pathway_label: str
+    stage_records: List[StageRecord] = field(default_factory=list)
+    description: str = ""
+
+    def get_stage(self, stage_code: str) -> Optional[StageRecord]:
+        return next((s for s in self.stage_records if s.stage_code == stage_code), None)
+
+    @property
+    def initial_biogenic_stock_kgco2e(self) -> float:
+        stage_a = self.get_stage("A")
+        return stage_a.retained_stock_kgco2e if stage_a else 0.0
+
+    @property
+    def total_process_emissions_kgco2e(self) -> float:
+        return sum(s.process_emissions_kgco2e for s in self.stage_records)
+
+    @property
+    def total_biogenic_release_kgco2e(self) -> float:
+        return sum(s.biogenic_release_kgco2e for s in self.stage_records)
+
+    @property
+    def final_retained_stock_kgco2e(self) -> float:
+        return self.stage_records[-1].retained_stock_kgco2e if self.stage_records else 0.0
+
+    @property
+    def net_carbon_balance_kgco2e(self) -> float:
+        return self.initial_biogenic_stock_kgco2e - self.total_process_emissions_kgco2e - self.total_biogenic_release_kgco2e
+
+    def summary_dict(self) -> Dict[str, Any]:
+        return {
+            "pathway_code": self.pathway_code,
+            "pathway_label": self.pathway_label,
+            "initial_biogenic_stock_kgco2e": self.initial_biogenic_stock_kgco2e,
+            "total_process_emissions_kgco2e": self.total_process_emissions_kgco2e,
+            "total_biogenic_release_kgco2e": self.total_biogenic_release_kgco2e,
+            "final_retained_stock_kgco2e": self.final_retained_stock_kgco2e,
+            "net_carbon_balance_kgco2e": self.net_carbon_balance_kgco2e,
+            "stage_count": len(self.stage_records),
+            "description": self.description,
+        }
+
+    def summary_df(self) -> pd.DataFrame:
+        return pd.DataFrame([self.summary_dict()], columns=SUMMARY_COLS)
+
+    def stage_df(self) -> pd.DataFrame:
+        df = pd.DataFrame(s.to_dict() for s in self.stage_records)
+        return df[[c for c in STAGE_TABLE_COLS if c in df.columns]] if not df.empty else df
+
+    def flow_df(self) -> pd.DataFrame:
+        df = pd.DataFrame(
+            {
+                "pathway_code": self.pathway_code,
+                "pathway_label": self.pathway_label,
+                "stage_code": s.stage_code,
+                "stage_label": s.stage_label,
+                "process_emissions_kgco2e": s.process_emissions_kgco2e,
+                "biogenic_release_kgco2e": s.biogenic_release_kgco2e,
+                "retained_stock_after_stage_kgco2e": s.retained_stock_kgco2e,
+            }
+            for s in self.stage_records
+        )
+        return df[[c for c in FLOW_COLS if c in df.columns]]
+
+# =========================================================
+# BLOCK 3 — CORE UTILITIES
+# =========================================================
+
+PATHWAY_ORDER_MAP = {code: i for i, code in enumerate(PATHWAY_ORDER)}
+STAGE_ORDER_MAP = {code: i for i, code in enumerate(STAGE_DISPLAY_ORDER)}
+
+
+def round_value(x: Any, digits: int = ROUND_DIGITS) -> Any:
+    return round(float(x), digits) if isinstance(x, (int, float, np.floating)) and not pd.isna(x) else x
+
+
+def as_dataframe(rows: Iterable[Dict[str, Any]]) -> pd.DataFrame:
+    rows = list(rows)
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+def reorder_columns(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    head = [c for c in cols if c in df.columns]
+    return df[head + [c for c in df.columns if c not in head]]
+
+
+def assert_unique_columns(df: pd.DataFrame, name: str = "DataFrame") -> None:
+    dup = df.columns[df.columns.duplicated()].tolist()
+    if dup:
+        raise ValueError(f"{name} has duplicate columns: {dup}")
+
+
+def _sort_by_map(df: pd.DataFrame, col: str, order_map: Dict[str, int], temp_col: str) -> pd.DataFrame:
+    if df.empty or col not in df.columns:
+        return df.copy()
+    out = df.copy()
+    out[temp_col] = out[col].map(order_map)
+    return out.sort_values(temp_col).drop(columns=temp_col).reset_index(drop=True)
+
+
+def sort_by_pathway_order(df: pd.DataFrame, col: str = "pathway_code") -> pd.DataFrame:
+    return _sort_by_map(df, col, PATHWAY_ORDER_MAP, "_pathway_order")
+
+
+def sort_by_stage_order(df: pd.DataFrame, col: str = "stage_code") -> pd.DataFrame:
+    return _sort_by_map(df, col, STAGE_ORDER_MAP, "_stage_order")
+
+
+def export_table(df: pd.DataFrame, filename: str, index: bool = False) -> None:
+    if EXPORT_RESULTS:
+        df.to_csv(TABLE_DIR / filename, index=index)
+
+
+def export_package(package: Dict[str, Any]) -> None:
+    if EXPORT_RESULTS:
+        for name, df in ((k, v) for k, v in package.items() if isinstance(v, pd.DataFrame)):
+            export_table(df, f"{name}.csv")
+
+
+def save_figure(filename: Optional[str]) -> Optional[Path]:
+    if SAVE_PLOTS and filename:
+        out_path = FIGURE_DIR / filename
+        plt.savefig(out_path, bbox_inches="tight")
+        return out_path
+    return None
+
+
+def validate_pathway_code(pathway_code: str) -> None:
+    if pathway_code not in PATHWAY_META:
+        raise ValueError(f"Unknown pathway_code '{pathway_code}'. Valid options: {', '.join(PATHWAY_ORDER)}")
+
+
+def get_pathway_meta(pathway_code: str) -> Dict[str, Any]:
+    validate_pathway_code(pathway_code)
+    return PATHWAY_META[pathway_code]
+
+
+def get_group_codes(group: str) -> List[str]:
+    codes = [code for code in PATHWAY_ORDER if PATHWAY_META[code]["group"] == group]
+    if not codes:
+        raise ValueError(f"No pathways found for group '{group}'.")
+    return codes
+
+
+def iter_results(results: Dict[str, PathwayResult], codes: Optional[List[str]] = None) -> Iterable[Tuple[str, PathwayResult]]:
+    for code in (codes or PATHWAY_ORDER):
+        if code in results:
+            yield code, results[code]
+
+
+def clone_constants(constants: ModelConstants, **updates: Any) -> ModelConstants:
+    return ModelConstants(**{**asdict(constants), **updates})
+
+
+def flatten_stage_tables(results: Dict[str, PathwayResult]) -> pd.DataFrame:
+    tables = []
+    for code, r in iter_results(results):
+        df = r.stage_df()
+        if not df.empty:
+            tables.append(df.assign(pathway_code=code, pathway_label=r.pathway_label))
+    if not tables:
+        return pd.DataFrame()
+    return reorder_columns(
+        sort_by_pathway_order(pd.concat(tables, ignore_index=True)),
+        ["pathway_code", "pathway_label"] + STAGE_TABLE_COLS,
+    )
+
+
+def flatten_flow_tables(results: Dict[str, PathwayResult]) -> pd.DataFrame:
+    tables = []
+    for _, r in iter_results(results):
+        df = r.flow_df()
+        if not df.empty:
+            tables.append(df)
+    if not tables:
+        return pd.DataFrame()
+    return reorder_columns(sort_by_pathway_order(pd.concat(tables, ignore_index=True)), FLOW_COLS)
+
+
+def build_summary_df(results: Dict[str, PathwayResult]) -> pd.DataFrame:
+    return reorder_columns(
+        sort_by_pathway_order(pd.DataFrame(r.summary_dict() for _, r in iter_results(results))),
+        SUMMARY_COLS,
+    )
+
+
+def print_section_title(title: str) -> None:
+    line = "=" * len(title)
+    print(f"\n{line}\n{title}\n{line}")
+
+# =========================================================
+# BLOCK 4 — STAGE CALCULATIONS
+# =========================================================
+
+D1_REFERENCE_YEAR_1 = 6.0
+D1_REFERENCE_YEAR_2 = 25.0
+D1_RETENTION_AT_YEAR_1 = 0.94
+D1_RETENTION_AT_YEAR_2 = 0.50
+
+
+def _make_stage(
+    stage: str,
+    *,
+    process: float = 0.0,
+    release: float = 0.0,
+    stock_end: float = 0.0,
+    stock_change: float = 0.0,
+    notes: str = "",
+    transport: float = 0.0,
+    electricity: float = 0.0,
+    steam: float = 0.0,
+    resin: float = 0.0,
+    harvesting: float = 0.0,
+    start_year: Optional[float] = None,
+    end_year: Optional[float] = None,
+) -> StageRecord:
+    return StageRecord(
+        stage_code=stage,
+        stage_label=stage,
+        process_emissions_kgco2e=process,
+        biogenic_release_kgco2e=release,
+        retained_stock_kgco2e=stock_end,
+        stock_change_kgco2e=stock_change,
+        transport_emissions_kgco2e=transport,
+        electricity_emissions_kgco2e=electricity,
+        steam_emissions_kgco2e=steam,
+        resin_emissions_kgco2e=resin,
+        harvesting_emissions_kgco2e=harvesting,
+        start_year=start_year,
+        end_year=end_year,
+        notes=notes,
+    )
+
+
+def _sum(*xs: float) -> float:
+    return sum(xs)
+
+
+def _per_kg(x_per_m3: float, c: ModelConstants) -> float:
+    return x_per_m3 / c.density_kg_per_m3
+
+
+def transport_emissions(
+    mass_kg: float,
+    distance_km: float,
+    ef_kgco2e_per_tkm: float,
+    c: ModelConstants = C,
+) -> float:
+    if min(mass_kg, distance_km, ef_kgco2e_per_tkm) < 0:
+        raise ValueError("mass_kg, distance_km, and ef_kgco2e_per_tkm must be >= 0.")
+    base_emissions = (mass_kg / 1000.0) * distance_km * ef_kgco2e_per_tkm
+    return base_emissions * c.transport_emissions_multiplier
+
+
+def ev_transport_from_tkm(
+    tkm_per_m3: float,
+    payload_t: float,
+    kwh_per_km: float,
+    grid_ef: float,
+    charging_loss_factor: float = 1.0,
+    c: ModelConstants = C,
+) -> Dict[str, float]:
+    if tkm_per_m3 < 0 or kwh_per_km < 0 or grid_ef < 0 or payload_t <= 0 or charging_loss_factor <= 0:
+        raise ValueError("Invalid EV transport inputs.")
+    vehicle_km_per_m3 = tkm_per_m3 / payload_t
+    electricity_kwh_per_m3 = vehicle_km_per_m3 * kwh_per_km * charging_loss_factor
+    kgco2e_per_m3 = electricity_kwh_per_m3 * grid_ef * c.transport_emissions_multiplier
+    kgco2e_per_tkm = (kwh_per_km * charging_loss_factor * grid_ef * c.transport_emissions_multiplier) / payload_t
+    return {
+        "vehicle_km_per_m3": vehicle_km_per_m3,
+        "electricity_kwh_per_m3": electricity_kwh_per_m3,
+        "kgco2e_per_m3": kgco2e_per_m3,
+        "kgco2e_per_tkm": kgco2e_per_tkm,
+        "kgco2e_per_kgkm": kgco2e_per_tkm / 1000.0,
+    }
+
+
+def _terminal_year(stage: StageRecord) -> float:
+    if stage.stage_code == "D1":
+        return 25.0
+    if stage.stage_code == "D2":
+        return 25.0
+    if stage.stage_code in {"D3", "E3"}:
+        return 50.0
+    raise ValueError(f"Unsupported stage code for terminal year: {stage.stage_code}")
+
+
+# -----------------------------
+# Decay functions
+# -----------------------------
+
+def bamboo_decay_no_maintenance_remaining(
+    initial_stock: float, 
+    years: float, 
+    retention_at_year_25: float = D1_RETENTION_AT_YEAR_2
+) -> float:
+    """Calculate remaining stock using piece-wise decay with custom endpoint retention."""
+    if initial_stock < 0 or years < 0:
+        raise ValueError("initial_stock and years must be >= 0.")
+    if not (0 < retention_at_year_25 <= 1):
+        raise ValueError("retention_at_year_25 must be between 0 and 1.")
+    
+    y1 = D1_RETENTION_AT_YEAR_1 * initial_stock
+    y2 = retention_at_year_25 * initial_stock
+    k1 = log(initial_stock / y1) / D1_REFERENCE_YEAR_1
+    k2 = log(y1 / y2) / (D1_REFERENCE_YEAR_2 - D1_REFERENCE_YEAR_1)
+    return initial_stock * exp(-k1 * years) if years <= D1_REFERENCE_YEAR_1 else y1 * exp(-k2 * (years - D1_REFERENCE_YEAR_1))
+
+def bamboo_decay_fraction_d1(year: float) -> float:
+    if year < 0:
+        raise ValueError("year must be >= 0.")
+    k1 = log(1.0 / D1_RETENTION_AT_YEAR_1) / D1_REFERENCE_YEAR_1
+    k2 = log(D1_RETENTION_AT_YEAR_1 / D1_RETENTION_AT_YEAR_2) / (D1_REFERENCE_YEAR_2 - D1_REFERENCE_YEAR_1)
+    return exp(-k1 * year) if year <= D1_REFERENCE_YEAR_1 else D1_RETENTION_AT_YEAR_1 * exp(-k2 * (year - D1_REFERENCE_YEAR_1))
+
+
+def continue_decay_from_stage_c_d1(carbon_at_year1: float, stage_d_duration_years: float) -> float:
+    if carbon_at_year1 < 0 or stage_d_duration_years < 0:
+        raise ValueError("carbon_at_year1 and stage_d_duration_years must be >= 0.")
+    start_year, end_year = 1.0, 1.0 + stage_d_duration_years
+    return carbon_at_year1 * (bamboo_decay_fraction_d1(end_year) / bamboo_decay_fraction_d1(start_year))
+
+
+def bamboo_decay_fraction_d3(year: float, retention_50y: float) -> float:
+    if year < 0 or not (0 < retention_50y <= 1):
+        raise ValueError("Invalid D3 decay inputs.")
+    retention_1y = bamboo_decay_fraction_d1(1.0)
+    if year <= 1.0:
+        return bamboo_decay_fraction_d1(year)
+    if year <= 50.0:
+        return retention_1y + (retention_50y - retention_1y) * ((year - 1.0) / 49.0)
+    return retention_50y
+
+
+def continue_decay_direct_d3(initial_stock: float, end_year: float, retention_50y: float) -> float:
+    if initial_stock < 0 or end_year < 0 or not (0 < retention_50y <= 1):
+        raise ValueError("Invalid D3 continuation inputs.")
+    return initial_stock * bamboo_decay_fraction_d3(end_year, retention_50y)
+
+
+# D2 uses the same piece-wise decay as D1 (6y @ 0.94, then to 0.50 at 25y)
+# No separate D2 decay function needed - use bamboo_decay_no_maintenance_remaining directly
+
+
+# -----------------------------
+# Stage D1 (Relocation pathway - from Stage C)
+# -----------------------------
+
+def _relocation_transport(c: ModelConstants) -> float:
+    return _sum(
+        transport_emissions(c.functional_unit_kg, c.osaka_expo_to_port_km, c.truck_kgco2e_per_tkm, c),
+        transport_emissions(c.functional_unit_kg, c.osaka_to_haikou_km, c.ship_kgco2e_per_tkm, c),
+        transport_emissions(c.functional_unit_kg, c.haikou_port_to_site_km, c.truck_kgco2e_per_tkm, c),
+    )
+
+
+def calculate_stage_d1(stage_c: StageRecord, c: ModelConstants = C) -> StageRecord:
+    start_stock = stage_c.retained_stock_kgco2e
+    process = _relocation_transport(c)
+    stock_end = continue_decay_from_stage_c_d1(start_stock, c.d1_secondary_service_life_years)
+    release = start_stock - stock_end
+    return _make_stage(
+        "D1",
+        process=process,
+        release=release,
+        stock_end=stock_end,
+        stock_change=-release,
+        notes="Relocation from Osaka to Hainan + 24-year secondary service life in Hainan.",
+        transport=process,
+        start_year=1.0,
+        end_year=25.0,
+    )
+
+
+# -----------------------------
+# Stage D2 (Direct deployment - from Stage A, 25-year life)
+# -----------------------------
+
+def _direct_transport(c: ModelConstants) -> float:
+    return _sum(
+        transport_emissions(c.functional_unit_kg, c.d23_truck1_distance_km, c.truck_kgco2e_per_tkm, c),
+        transport_emissions(c.functional_unit_kg, c.d23_ferry_distance_km, c.d23_ferry_kgco2e_per_tkm, c),
+        transport_emissions(c.functional_unit_kg, c.d23_truck2_distance_km, c.truck_kgco2e_per_tkm, c),
+    )
+
+
+def calculate_stage_d2(stage_a: StageRecord, c: ModelConstants = C) -> StageRecord:
+    start_stock = stage_a.retained_stock_kgco2e
+    process = _direct_transport(c)
+    stock_end = bamboo_decay_no_maintenance_remaining(
+        start_stock, 
+        c.d2_service_life_years, 
+        c.d2_retention_at_year_25
+    )
+    release = start_stock - stock_end
+    return _make_stage(
+        "D2",
+        process=process,
+        release=release,
+        stock_end=stock_end,
+        stock_change=-release,
+        notes=f"Direct deployment from Zhejiang to Hainan + 25-year secondary service life with {c.d2_retention_at_year_25:.0%} retention at year 25.",
+        transport=process,
+        start_year=0.0,
+        end_year=25.0,
+    )
+
+
+# -----------------------------
+# Stage D3 (Direct deployment - from Stage A, 50-year life) - WITH EV TRANSPORT
+# -----------------------------
+
+def _direct_transport_d3_ev(c: ModelConstants) -> float:
+    """EV transport for D3 with grid-specific emission factors"""
+    mass_tonnes = c.functional_unit_kg / 1000.0
+    
+    # Leg 1: Anji (Zhejiang) to port - using Zhejiang grid
+    tkm_leg1 = mass_tonnes * c.d23_truck1_distance_km
+    vehicle_km_leg1 = tkm_leg1 / (c.d3_ev_truck_payload_kg / 1000.0)
+    electricity_kwh_leg1 = vehicle_km_leg1 * c.d3_ev_truck_kwh_per_km * c.d3_ev_charging_loss_factor
+    emissions_leg1 = electricity_kwh_leg1 * c.zhejiang_grid_kgco2e_per_kwh * c.transport_emissions_multiplier
+    
+    # Leg 2: Ferry (same as before - no EV change)
+    emissions_leg2 = transport_emissions(
+        c.functional_unit_kg, 
+        c.d23_ferry_distance_km, 
+        c.d23_ferry_kgco2e_per_tkm,
+        c
+    )
+    
+    # Leg 3: Haikou port to West Coast Belt Park - using Hainan grid
+    tkm_leg3 = mass_tonnes * c.d23_truck2_distance_km  
+    vehicle_km_leg3 = tkm_leg3 / (c.d3_ev_truck_payload_kg / 1000.0)  
+    electricity_kwh_leg3 = vehicle_km_leg3 * c.d3_ev_truck_kwh_per_km * c.d3_ev_charging_loss_factor
+    emissions_leg3 = electricity_kwh_leg3 * c.hainan_grid_kgco2e_per_kwh * c.transport_emissions_multiplier
+    
+    return emissions_leg1 + emissions_leg2 + emissions_leg3
+
+
+def calculate_stage_d3(stage_a: StageRecord, c: ModelConstants = C) -> StageRecord:
+    start_stock = stage_a.retained_stock_kgco2e
+    process = _direct_transport_d3_ev(c) 
+    stock_end = continue_decay_direct_d3(start_stock, c.d3_end_of_service_year, c.d3_target_retention_fraction_at_year50)
+    release = start_stock - stock_end
+    return _make_stage(
+        "D3",
+        process=process,
+        release=release,
+        stock_end=stock_end,
+        stock_change=-release,
+        notes="Direct deployment from Zhejiang to Hainan + 50-year secondary service life with EV transport (Zhejiang grid to port, Hainan grid to park).",
+        transport=process,
+        start_year=0.0,
+        end_year=50.0,
+    )
+
+
+# -----------------------------
+# Stage A
+# -----------------------------
+
+def calculate_initial_biogenic_stock(c: ModelConstants = C) -> float:
+    bamboo_mass = c.functional_unit_kg * c.bamboo_fraction
+    carbon_mass = bamboo_mass * c.carbon_fraction_bamboo_dry
+    return carbon_mass * c.co2_to_c_molecular_ratio
+
+
+def calculate_stage_a(c: ModelConstants = C) -> StageRecord:
+    stock = calculate_initial_biogenic_stock(c)
+    return _make_stage("A", stock_end=stock, stock_change=stock, notes="Initial biogenic carbon stock.", start_year=0.0, end_year=0.0)
+
+
+# -----------------------------
+# Stage B
+# -----------------------------
+
+def _stage_b_workload(c: ModelConstants = C) -> Dict[str, float]:
+    bamboo_mass = c.density_kg_per_m3 * c.bamboo_fraction
+    resin_mass = c.density_kg_per_m3 * c.resin_fraction
+    bamboo_input_fp = bamboo_mass / c.recovery_rate_fp
+    bamboo_input_cp = bamboo_input_fp / c.recovery_rate_cp
+    residue = bamboo_input_cp - bamboo_mass
+    electricity = c.bundle_electricity_kwh_per_m3 + c.final_beam_electricity_kwh_per_m3
+    steam = c.bundle_steam_kwh_per_m3 / c.recovery_rate_ep
+    return {
+        "bamboo_mass_kg_per_m3": bamboo_mass,
+        "resin_mass_kg_per_m3": resin_mass,
+        "bamboo_input_fp_kg_per_m3": bamboo_input_fp,
+        "bamboo_input_cp_kg_per_m3": bamboo_input_cp,
+        "residue_generated_kg_per_m3": residue,
+        "total_electricity_kwh_per_m3": electricity,
+        "steam_input_kwh_per_m3": steam,
+        "transport1_tkm_per_m3": (bamboo_input_cp / 1000.0) * c.transport1_distance_km_stage_b,
+        "transport2_tkm_per_m3": (bamboo_input_fp / 1000.0) * c.transport2_distance_km_stage_b,
+    }
+
+
+def _build_stage_b(
+    stage: str,
+    c: ModelConstants,
+    notes: str,
+    *,
+    harvesting_per_m3: float,
+    electricity_per_m3: float,
+    steam_per_m3: float,
+    resin_per_m3: float,
+    transport_per_m3: float,
+) -> StageRecord:
+    total = harvesting_per_m3 + electricity_per_m3 + steam_per_m3 + resin_per_m3 + transport_per_m3
+    return _make_stage(
+        stage,
+        process=_per_kg(total, c),
+        stock_end=0.0,
+        stock_change=0.0,
+        notes=notes,
+        transport=_per_kg(transport_per_m3, c),
+        electricity=_per_kg(electricity_per_m3, c),
+        steam=_per_kg(steam_per_m3, c),
+        resin=_per_kg(resin_per_m3, c),
+        harvesting=_per_kg(harvesting_per_m3, c),
+        start_year=0.0,
+        end_year=0.0,
+    )
+
+
+def calculate_stage_b1(c: ModelConstants = C) -> StageRecord:
+    w = _stage_b_workload(c)
+    return _build_stage_b(
+        "B1",
+        c,
+        "Baseline manufacturing emissions using recovery-rate-adjusted upstream bamboo inputs and transport tonne-km.",
+        harvesting_per_m3=c.harvesting_machine_hours_per_m3 * c.harvesting_kgco2e_per_hr_power_saw,
+        electricity_per_m3=w["total_electricity_kwh_per_m3"] * c.electricity_kgco2e_per_kwh,
+        steam_per_m3=w["steam_input_kwh_per_m3"] * c.steam_kgco2e_per_kwh,
+        resin_per_m3=w["resin_mass_kg_per_m3"] * c.phenolic_resin_kgco2e_per_kg,
+        transport_per_m3=_sum(
+            w["transport1_tkm_per_m3"] * c.transport1_kgco2e_per_tkm_stage_b,
+            w["transport2_tkm_per_m3"] * c.transport2_kgco2e_per_tkm_stage_b,
+        ),
+    )
+
+
+def calculate_stage_b2(c: ModelConstants = C) -> StageRecord:
+    w = _stage_b_workload(c)
+    grid_kwh = w["total_electricity_kwh_per_m3"] * (1.0 - c.pv_substitution_share)
+    small = ev_transport_from_tkm(w["transport1_tkm_per_m3"], c.small_lorry_payload_t, c.ev_small_lorry_kwh_per_km, c.electricity_kgco2e_per_kwh, c.charging_loss_factor, c)
+    heavy = ev_transport_from_tkm(w["transport2_tkm_per_m3"], c.heavy_lorry_payload_t, c.ev_heavy_lorry_kwh_per_km, c.electricity_kgco2e_per_kwh, c.charging_loss_factor, c)
+    return _build_stage_b(
+        "B2",
+        c,
+        "Green energy scenario using baseline B1 transport tonne-km, rooftop PV substitution, and EV transport conversion.",
+        harvesting_per_m3=c.harvesting_machine_hours_per_m3 * c.harvesting_kgco2e_per_hr_power_saw,
+        electricity_per_m3=grid_kwh * c.electricity_kgco2e_per_kwh,
+        steam_per_m3=w["steam_input_kwh_per_m3"] * c.steam_kgco2e_per_kwh,
+        resin_per_m3=w["resin_mass_kg_per_m3"] * c.phenolic_resin_kgco2e_per_kg,
+        transport_per_m3=_sum(small["kgco2e_per_m3"], heavy["kgco2e_per_m3"]),
+    )
+
+
+def calculate_stage_b3(c: ModelConstants = C) -> StageRecord:
+    w = _stage_b_workload(c)
+    grid_kwh = w["total_electricity_kwh_per_m3"] * (1.0 - c.pv_substitution_share)
+    residue_tkm = (w["residue_generated_kg_per_m3"] / 1000.0) * c.transport1_distance_km_stage_b
+    small = ev_transport_from_tkm(w["transport1_tkm_per_m3"] + residue_tkm, c.small_lorry_payload_t, c.ev_small_lorry_kwh_per_km, c.electricity_kgco2e_per_kwh, c.charging_loss_factor, c)
+    heavy = ev_transport_from_tkm(w["transport2_tkm_per_m3"], c.heavy_lorry_payload_t, c.ev_heavy_lorry_kwh_per_km, c.electricity_kgco2e_per_kwh, c.charging_loss_factor, c)
+    
+    # Calculate blended resin emission factor based on lignin substitution rate
+    # substitution_rate = 1.0 → 100% lignin resin (EF = 2.18)
+    # substitution_rate = 0.0 → 100% phenolic resin (EF = 3.13)
+    blended_resin_ef = (c.phenolic_resin_kgco2e_per_kg * (1 - c.lignin_substitution_rate) + 
+                         c.lignin_resin_kgco2e_per_kg * c.lignin_substitution_rate)
+    
+    return _build_stage_b(
+        "B3",
+        c,
+        f"Green inputs scenario using {c.pv_substitution_share:.0%} PV substitution, {c.lignin_substitution_rate:.0%} lignin resin, residue-fired steam replacement, and extra residue transport on the small-lorry EV leg.",
+        harvesting_per_m3=c.harvesting_machine_hours_per_m3 * c.harvesting_kgco2e_per_hr_power_saw,
+        electricity_per_m3=grid_kwh * c.electricity_kgco2e_per_kwh,
+        steam_per_m3=0.0,
+        resin_per_m3=w["resin_mass_kg_per_m3"] * blended_resin_ef,  
+        transport_per_m3=_sum(small["kgco2e_per_m3"], heavy["kgco2e_per_m3"]),
+    )
+
+
+B_STAGE_FUNCS = {"B1": calculate_stage_b1, "B2": calculate_stage_b2, "B3": calculate_stage_b3}
+
+
+def calculate_stage_b(stage_code: str, c: ModelConstants = C) -> StageRecord:
+    try:
+        return B_STAGE_FUNCS[stage_code](c)
+    except KeyError as e:
+        raise ValueError(f"Unsupported Stage B code: {stage_code}") from e
+
+
+# -----------------------------
+# Stage C and C1
+# -----------------------------
+
+def calculate_stage_c(stage_a: StageRecord, c: ModelConstants = C) -> StageRecord:
+    initial_stock = stage_a.retained_stock_kgco2e
+    process = _sum(
+        transport_emissions(c.functional_unit_kg, c.stage_c_transport1_distance_km, c.truck_kgco2e_per_tkm, c),
+        transport_emissions(c.functional_unit_kg, c.stage_c_transport2_distance_km, c.ship_kgco2e_per_tkm, c),
+        transport_emissions(c.functional_unit_kg, c.stage_c_transport3_distance_km, c.truck_kgco2e_per_tkm, c),
+    )
+    stock_end = bamboo_decay_no_maintenance_remaining(initial_stock, c.stage_c_project_duration_years)
+    release = initial_stock - stock_end
+    return _make_stage(
+        "C",
+        process=process,
+        release=release,
+        stock_end=stock_end,
+        stock_change=-release,
+        notes="Export transport + 1-year decay in Osaka.",
+        transport=process,
+        start_year=0.0,
+        end_year=1.0,
+    )
+
+
+def calculate_stage_c1(stage_a: StageRecord, stage_c: StageRecord, c: ModelConstants = C) -> StageRecord:
+    initial_stock = stage_a.retained_stock_kgco2e
+    stock_before = stage_c.retained_stock_kgco2e
+    retained_mass_fraction = 0.0 if initial_stock <= 0 else stock_before / initial_stock
+    remaining_mass = c.functional_unit_kg * retained_mass_fraction
+    process = transport_emissions(remaining_mass, c.stage_c1_transport4_distance_km, c.truck_kgco2e_per_tkm, c)
+    return _make_stage(
+        "C1",
+        process=process,
+        release=stock_before,
+        stock_end=0.0,
+        stock_change=-stock_before,
+        notes="Disposal in Osaka using remaining product mass after year-1 decay.",
+        transport=process,
+        start_year=1.0,
+        end_year=1.0,
+    )
+
+
+# -----------------------------
+# Stage E1, E2, E3
+# -----------------------------
+
+def calculate_stage_e1(stage_d: StageRecord, c: ModelConstants = C) -> StageRecord:
+    entering = stage_d.retained_stock_kgco2e
+    electricity = c.west_coast_park_to_incinerator_km * c.ev_heavy_lorry_kwh_per_km * (c.functional_unit_kg / c.heavy_lorry_payload_kg_e1)
+    process = electricity * c.hainan_grid_kgco2e_per_kwh * c.transport_emissions_multiplier
+    yr = _terminal_year(stage_d)
+    return _make_stage(
+        "E1",
+        process=process,
+        release=entering,
+        stock_end=0.0,
+        stock_change=-entering,
+        notes="Hainan transport + full incineration.",
+        transport=process,
+        start_year=yr,
+        end_year=yr,
+    )
+
+
+def _calculate_stage_biochar(stage: str, stage_d: StageRecord, retention: float, notes: str) -> StageRecord:
+    entering = stage_d.retained_stock_kgco2e
+    stock_end = entering * retention
+    release = entering - stock_end
+    yr = 50.0 if stage == "E3" else _terminal_year(stage_d)
+    return _make_stage(stage, process=0.0, release=release, stock_end=stock_end, stock_change=-release, notes=notes, start_year=yr, end_year=yr)
+
+
+def calculate_stage_e2(stage_d: StageRecord, c: ModelConstants = C) -> StageRecord:
+    return _calculate_stage_biochar("E2", stage_d, c.biochar_retention_e2, "Fast pyrolysis with fixed 15% biochar retention.")
+
+
+def calculate_stage_e3(stage_d: StageRecord, c: ModelConstants = C) -> StageRecord:
+    return _calculate_stage_biochar("E3", stage_d, c.biochar_retention_e3, "Carbon storage maximisation via 70% biochar retention.")
+
+
+D_STAGE_FUNCS = {
+    "D1": calculate_stage_d1,
+    "D2": calculate_stage_d2,
+    "D3": calculate_stage_d3,
+}
+
+E_STAGE_FUNCS = {"E1": calculate_stage_e1, "E2": calculate_stage_e2, "E3": calculate_stage_e3}
+
+# =========================================================
+# BLOCK 5 — PATHWAY EXECUTION
+# =========================================================
+
+def carry_stock_through_stage(raw_stage: StageRecord, retained_stock: float) -> StageRecord:
+    return raw_stage.copy_with(
+        biogenic_release_kgco2e=0.0,
+        retained_stock_kgco2e=retained_stock,
+        stock_change_kgco2e=0.0,
+    )
+
+
+def _run_stage(
+    stage_map: Dict[str, Callable],
+    stage_code: Optional[str],
+    *,
+    err_label: str,
+    pathway_code: str,
+    args: Tuple[Any, ...],
+) -> StageRecord:
+    if stage_code is None:
+        raise ValueError(f"Pathway '{pathway_code}' requires a {err_label} stage but received None.")
+    try:
+        return stage_map[stage_code](*args)
+    except KeyError as e:
+        raise ValueError(f"Unsupported {err_label}_stage '{stage_code}' for pathway '{pathway_code}'.") from e
+
+
+def run_pathway(pathway_code: str, c: ModelConstants = C) -> PathwayResult:
+    meta = get_pathway_meta(pathway_code)
+
+    a = calculate_stage_a(c)
+    b = carry_stock_through_stage(calculate_stage_b(meta["b_stage"], c), a.retained_stock_kgco2e)
+
+    stages = [a, b]
+
+    if meta["use_stage_c"]:
+        c_stage = calculate_stage_c(a, c)
+        stages.append(c_stage)
+
+        if meta["end_stage"] == "C1":
+            stages.append(calculate_stage_c1(a, c_stage, c))
+        else:
+            d = _run_stage(
+                D_STAGE_FUNCS,
+                meta["d_stage"],
+                err_label="d",
+                pathway_code=pathway_code,
+                args=(c_stage, c),
+            )
+            e = _run_stage(
+                E_STAGE_FUNCS,
+                meta["end_stage"],
+                err_label="end",
+                pathway_code=pathway_code,
+                args=(d, c),
+            )
+            stages += [d, e]
+    else:
+        d = _run_stage(
+            D_STAGE_FUNCS,
+            meta["d_stage"],
+            err_label="d",
+            pathway_code=pathway_code,
+            args=(a, c),
+        )
+        e = _run_stage(
+            E_STAGE_FUNCS,
+            meta["end_stage"],
+            err_label="end",
+            pathway_code=pathway_code,
+            args=(d, c),
+        )
+        stages += [d, e]
+
+    return PathwayResult(
+        pathway_code=pathway_code,
+        pathway_label=meta["label"],
+        stage_records=stages,
+        description=meta["description"],
+    )
+
+def run_all_pathways(c: ModelConstants = C, pathway_codes: Optional[List[str]] = None) -> Dict[str, PathwayResult]:
+    return {code: run_pathway(code, c) for code in (pathway_codes or PATHWAY_ORDER)}
+
+
+def run_group(group: str, c: ModelConstants = C) -> Dict[str, PathwayResult]:
+    return run_all_pathways(c, get_group_codes(group))
+
+
+def rerun_pathway(pathway_code: str, c: ModelConstants = C, **updates: Any) -> PathwayResult:
+    return run_pathway(pathway_code, clone_constants(c, **updates))
+
+
+def rerun_all(c: ModelConstants = C, pathway_codes: Optional[List[str]] = None, **updates: Any) -> Dict[str, PathwayResult]:
+    return run_all_pathways(clone_constants(c, **updates), pathway_codes)
+
+# =========================================================
+# BLOCK 6 — ANALYSIS BUILDERS
+# =========================================================
+
+MAX_DECARB_PARAMETER_SPECS = [
+    {
+        "name": "Biochar retention rate",
+        "param": "biochar_retention_e3",
+        "min": 0.30,
+        "max": 0.70,
+        "lower_is_better": False,
+    },
+    {
+        "name": "Grid carbon intensity (kg CO2e/kWh)",
+        "param": "electricity_kgco2e_per_kwh",
+        "min": 0.1333,
+        "max": 0.6796,
+        "lower_is_better": True,
+        "note": "National avg: 0.6096",
+    },
+    {
+        "name": "End-of-service carbon retention",
+        "param": "d3_target_retention_fraction_at_year50",
+        "min": 0.50,
+        "max": 0.85,
+        "lower_is_better": False,
+    },
+    {
+        "name": "Manufacturing energy intensity",
+        "param": "manufacturing_energy_multiplier",
+        "min": 0.70,
+        "max": 1.30,
+        "lower_is_better": True,
+    },
+    {
+        "name": "Transport emissions multiplier",
+        "param": "transport_emissions_multiplier",
+        "min": 0.60,
+        "max": 1.40,
+        "lower_is_better": True,
+    },
+    {
+        "name": "Lignin resin substitution rate",
+        "param": "lignin_substitution_rate",
+        "min": 0.50,
+        "max": 1.00,
+        "lower_is_better": False,
+    },
+    {
+        "name": "PV substitution share",
+        "param": "pv_substitution_share",
+        "min": 0.00,
+        "max": 0.80,
+        "lower_is_better": False,
+    },
+]
+
+def _get_max_decarb_parameter_specs(constants: ModelConstants = C) -> List[Dict[str, Any]]:
+    specs = []
+    for spec in MAX_DECARB_PARAMETER_SPECS:
+        copied = dict(spec)
+        param = copied["param"]
+
+        if param == "manufacturing_energy_multiplier":
+            copied["base"] = 1.0
+        else:
+            copied["base"] = getattr(constants, param)
+
+        specs.append(copied)
+    return specs
+
+
+def _apply_max_decarb_parameter(
+    constants: ModelConstants,
+    param: str,
+    value: float,
+) -> ModelConstants:
+    if param == "manufacturing_energy_multiplier":
+        return clone_constants(
+            constants,
+            bundle_electricity_kwh_per_m3=constants.bundle_electricity_kwh_per_m3 * value,
+            final_beam_electricity_kwh_per_m3=constants.final_beam_electricity_kwh_per_m3 * value,
+            bundle_steam_kwh_per_m3=constants.bundle_steam_kwh_per_m3 * value,
+        )
+
+    return clone_constants(constants, **{param: value})
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(x, hi))
+
+
+def _stage_rows(r: PathwayResult) -> List[Dict[str, Any]]:
+    return [{
+        "pathway_code": r.pathway_code,
+        "pathway_label": r.pathway_label,
+        "stage_code": s.stage_code,
+        "stage_label": s.stage_label,
+        "process_emissions_kgco2e": s.process_emissions_kgco2e,
+        "biogenic_release_kgco2e": s.biogenic_release_kgco2e,
+        "total_stage_impact_kgco2e": s.total_stage_impact_kgco2e,
+        "retained_stock_kgco2e": s.retained_stock_kgco2e,
+        "stock_change_kgco2e": s.stock_change_kgco2e,
+    } for s in r.stage_records]
+
+
+def _group_stage_long(results: Dict[str, PathwayResult], group: str) -> pd.DataFrame:
+    codes = get_group_codes(group)
+    df = as_dataframe(row for code in codes if code in results for row in _stage_rows(results[code]))
+    if df.empty:
+        return df
+    df["_p"] = df["pathway_code"].map({c: i for i, c in enumerate(codes)})
+    df["_s"] = df["stage_code"].map(STAGE_ORDER_MAP)
+    return reorder_columns(
+        df.sort_values(["_s", "_p"]).drop(columns=["_p", "_s"]).reset_index(drop=True),
+        STAGE_CONTRIBUTION_COLS,
+    )
+
+
+def _group_stage_pivot(results: Dict[str, PathwayResult], group: str, value_col: str) -> pd.DataFrame:
+    df = _group_stage_long(results, group)
+    if df.empty:
+        return df
+    return sort_by_stage_order(
+        df.pivot_table(index=["stage_code", "stage_label"], columns="pathway_label", values=value_col, aggfunc="first").reset_index()
+    )
+
+
+def _group_stage_split_pivot(results: Dict[str, PathwayResult], group: str) -> pd.DataFrame:
+    df = _group_stage_long(results, group)
+    if df.empty:
+        return df
+    p = df.pivot_table(index=["stage_code", "stage_label"], columns="pathway_label", values="process_emissions_kgco2e", aggfunc="first")
+    b = df.pivot_table(index=["stage_code", "stage_label"], columns="pathway_label", values="biogenic_release_kgco2e", aggfunc="first")
+    p.columns = [f"{c} | Process emissions" for c in p.columns]
+    b.columns = [f"{c} | Biogenic release" for c in b.columns]
+    return sort_by_stage_order(pd.concat([p, b], axis=1).reset_index())
+
+
+def _group_summary(results: Dict[str, PathwayResult], group: str) -> pd.DataFrame:
+    return reorder_columns(as_dataframe(
+        {**r.summary_dict(), "group": group, "scenario": r.pathway_label, "pathway": r.pathway_code}
+        for _, r in iter_results(results, get_group_codes(group))
+    ), GROUP_SUMMARY_COLS)
+
+def _retention_df(r: PathwayResult) -> pd.DataFrame:
+    return reorder_columns(pd.DataFrame([{
+        "pathway_code": r.pathway_code,
+        "pathway_label": r.pathway_label,
+        "stage_code": s.stage_code,
+        "stage_label": s.stage_label,
+        "start_year": s.start_year,
+        "end_year": s.end_year,
+        "retained_stock_kgco2e": s.retained_stock_kgco2e,
+        "stock_change_kgco2e": s.stock_change_kgco2e,
+    } for s in r.stage_records]), RETENTION_COLS)
+
+
+def _pathway_order_df() -> pd.DataFrame:
+    return pd.DataFrame([{
+        "display_order": i,
+        "pathway_code": code,
+        "pathway_label": meta["label"],
+        "group": meta["group"],
+        "stages": " -> ".join(meta["stages"]),
+        "description": meta["description"],
+    } for i, (code, meta) in enumerate(PATHWAY_META.items(), start=1)])
+
+
+def _stock_points(r: PathwayResult) -> List[Tuple[float, float, str]]:
+    a = r.get_stage("A")
+    if a is None:
+        raise ValueError(f"Pathway '{r.pathway_code}' is missing Stage A.")
+
+    pts = [(0.0, a.retained_stock_kgco2e, "A")]
+
+    c = r.get_stage("C")
+    c1 = r.get_stage("C1")
+    d1 = r.get_stage("D1")
+    d2 = r.get_stage("D2")
+    d3 = r.get_stage("D3")
+    e1 = r.get_stage("E1")
+    e2 = r.get_stage("E2")
+    e3 = r.get_stage("E3")
+
+    if c is not None:
+        pts.append((1.0, c.retained_stock_kgco2e, "C"))
+
+    if c1 is not None:
+        pts.append((1.0, c1.retained_stock_kgco2e, "C1"))
+        return pts
+
+    if d1 is not None:
+        pts.append((25.0, d1.retained_stock_kgco2e, "D1"))
+        if e1 is not None:
+            pts.append((25.0, e1.retained_stock_kgco2e, "E1"))
+        elif e2 is not None:
+            pts.append((25.0, e2.retained_stock_kgco2e, "E2"))
+        elif e3 is not None:
+            pts.append((25.0, e3.retained_stock_kgco2e, "E3"))
+        return pts
+
+    if d2 is not None:
+        pts.append((25.0, d2.retained_stock_kgco2e, "D2"))
+        if e1 is not None:
+            pts.append((25.0, e1.retained_stock_kgco2e, "E1"))
+        elif e2 is not None:
+            pts.append((25.0, e2.retained_stock_kgco2e, "E2"))
+        elif e3 is not None:
+            pts.append((25.0, e3.retained_stock_kgco2e, "E3"))
+        return pts
+
+    if d3 is not None:
+        pts.append((50.0, d3.retained_stock_kgco2e, "D3"))
+        if e1 is not None:
+            pts.append((50.0, e1.retained_stock_kgco2e, "E1"))
+        elif e2 is not None:
+            pts.append((50.0, e2.retained_stock_kgco2e, "E2"))
+        elif e3 is not None:
+            pts.append((50.0, e3.retained_stock_kgco2e, "E3"))
+        return pts
+
+    raise ValueError(f"Could not build stock trajectory for pathway '{r.pathway_code}'.")
+
+def _integrate_stock(points: List[Tuple[float, float, str]], horizon_years: float) -> float:
+    """Calculate area under stock retention curve using trapezoidal integration."""
+    if horizon_years <= 0:
+        raise ValueError("horizon_years must be > 0.")
+    if not points:
+        return 0.0
+    
+    # Ensure points are sorted by time
+    sorted_points = sorted(points, key=lambda x: x[0])
+    
+    area = 0.0
+    for i in range(len(sorted_points) - 1):
+        t0, s0, _ = sorted_points[i]
+        t1, s1, _ = sorted_points[i + 1]
+        
+        if t0 >= horizon_years:
+            break
+        
+        seg_end = min(t1, horizon_years)
+        if seg_end <= t0:
+            continue
+        
+        dur = seg_end - t0
+        # Linear interpolation for stock at seg_end if needed
+        if t1 == t0:
+            s_end = s0
+        else:
+            s_end = s0 + ((s1 - s0) / (t1 - t0)) * (seg_end - t0)
+        
+        area += 0.5 * (s0 + s_end) * dur
+        
+        if t1 >= horizon_years:
+            return area
+    
+    # Extend to horizon if last point is before horizon
+    t_last, s_last, _ = sorted_points[-1]
+    if t_last < horizon_years:
+        area += s_last * (horizon_years - t_last)
+    
+    return area
+
+def _temporal_metrics(r: PathwayResult, horizon_years: float) -> Dict[str, Any]:
+    pts = _stock_points(r)
+    area = _integrate_stock(pts, horizon_years)
+    return {
+        "pathway_code": r.pathway_code,
+        "pathway_label": r.pathway_label,
+        "horizon_years": horizon_years,
+        "temporal_storage_benefit_kgco2e_year": area,
+        "temporal_storage_benefit_tco2e_year": area / 1000.0,
+        "temporal_storage_benefit_normalised_tco2e": area / 1000.0 / horizon_years,
+        "average_retained_stock_tco2e": area / horizon_years / 1000.0,
+        "end_of_horizon_retained_stock_tco2e": pts[-1][1] / 1000.0,
+        "stock_trajectory": " -> ".join(f"{lab}@{t:g}y:{s:.6f}" for t, s, lab in pts),
+    }
+
+
+def _baseline_case_constants(
+    constants: ModelConstants = C,
+    electricity_ef: Optional[float] = None,
+    resin_fraction: Optional[float] = None,
+    manufacturing_energy_multiplier: float = 1.0,
+    transport_emissions_multiplier: float = 1.0,
+    retention_at_year_25: Optional[float] = None,
+) -> ModelConstants:
+    resin_fraction = constants.resin_fraction if resin_fraction is None else _clamp(resin_fraction, 0.01, 0.99)
+    return clone_constants(
+        constants,
+        bamboo_fraction=1.0 - resin_fraction,
+        resin_fraction=resin_fraction,
+        electricity_kgco2e_per_kwh=constants.electricity_kgco2e_per_kwh if electricity_ef is None else electricity_ef,
+        bundle_electricity_kwh_per_m3=constants.bundle_electricity_kwh_per_m3 * manufacturing_energy_multiplier,
+        final_beam_electricity_kwh_per_m3=constants.final_beam_electricity_kwh_per_m3 * manufacturing_energy_multiplier,
+        bundle_steam_kwh_per_m3=constants.bundle_steam_kwh_per_m3 * manufacturing_energy_multiplier,
+        transport_emissions_multiplier=transport_emissions_multiplier,
+        d2_retention_at_year_25=retention_at_year_25 if retention_at_year_25 is not None else constants.d2_retention_at_year_25,
+        d2_service_life_years=constants.d2_service_life_years,
+    )
+
+    
+def _baseline_sensitivity_result(
+    constants: ModelConstants = C,
+    electricity_ef: Optional[float] = None,
+    resin_fraction: Optional[float] = None,
+    manufacturing_energy_multiplier: float = 1.0,
+    transport_emissions_multiplier: float = 1.0,
+    retention_at_year_25: Optional[float] = None,
+    biochar_fraction: Optional[float] = None,
+) -> PathwayResult:
+    case = _baseline_case_constants(
+        constants=constants,
+        electricity_ef=electricity_ef,
+        resin_fraction=resin_fraction,
+        manufacturing_energy_multiplier=manufacturing_energy_multiplier,
+        transport_emissions_multiplier=transport_emissions_multiplier,
+        retention_at_year_25=retention_at_year_25,
+    )
+
+    result = run_pathway(BASELINE_PATHWAY_CODE, case)
+
+    if biochar_fraction is None:
+        return result
+
+    adjusted_stages = list(result.stage_records)
+    d_stage = next(s for s in adjusted_stages if s.stage_code == "D2")
+    adjusted_e2 = _calculate_stage_biochar(
+        "E2",
+        d_stage,
+        _clamp(biochar_fraction, 0.0, 1.0),
+        "Counterfactual biochar-retention sensitivity case on baseline pathway.",
+    )
+    adjusted_stages[-1] = adjusted_e2
+
+    return PathwayResult(
+        pathway_code=result.pathway_code,
+        pathway_label="Baseline sensitivity case with biochar",
+        stage_records=adjusted_stages,
+        description="Baseline pathway generated through run_pathway() and modified only for E2 biochar sensitivity.",
+    )
+
+
+def _sensitivity_runs(constants: ModelConstants = C) -> List[Tuple[str, float, Callable[[float], PathwayResult]]]:
+    return [
+        ("Electricity emission factor", constants.electricity_kgco2e_per_kwh, lambda v: _baseline_sensitivity_result(constants, electricity_ef=v)),
+        ("Resin fraction", constants.resin_fraction, lambda v: _baseline_sensitivity_result(constants, resin_fraction=v)),
+        ("Manufacturing energy intensity", 1.0, lambda v: _baseline_sensitivity_result(constants, manufacturing_energy_multiplier=v)),
+        ("Total transport emissions", 1.0, lambda v: _baseline_sensitivity_result(constants, transport_emissions_multiplier=v)),
+        ("Carbon retention at year 25", constants.d2_retention_at_year_25, lambda v: _baseline_sensitivity_result(constants, retention_at_year_25=v)),
+        ("Biochar fraction", 0.0, lambda v: _baseline_sensitivity_result(constants, biochar_fraction=v)),
+    ]
+
+
+def _build_reporting_outputs(results: Dict[str, PathwayResult]) -> Dict[str, pd.DataFrame]:
+    baseline, max_case = results[BASELINE_PATHWAY_CODE], results[ASPIRATIONAL_PATHWAY_CODE]
+    carbon_negativity = pd.DataFrame([{
+        "pathway_code": r.pathway_code,
+        "pathway_label": r.pathway_label,
+        "net_carbon_balance_kgco2e": r.net_carbon_balance_kgco2e,
+        "carbon_negative": r.net_carbon_balance_kgco2e > 0,
+        "interpretation_label": "Carbon negative" if r.net_carbon_balance_kgco2e > 0.05 else ("Carbon positive" if r.net_carbon_balance_kgco2e < -0.05 else "Near carbon neutral"),
+    } for _, r in iter_results(results)])
+    carbon_negativity = reorder_columns(carbon_negativity.sort_values("net_carbon_balance_kgco2e").reset_index(drop=True), CARBON_NEGATIVITY_COLS)
+
+    return {
+        "summary": build_summary_df(results),
+        "stage_breakdown": flatten_stage_tables(results),
+        "flow": flatten_flow_tables(results),
+        "pathway_order": _pathway_order_df(),
+        "phase_1_summary": _group_summary(results, "phase_1"),
+        "phase_2_summary": _group_summary(results, "phase_2"),
+        "baseline_stage_contribution": reorder_columns(as_dataframe(_stage_rows(baseline)), STAGE_CONTRIBUTION_COLS),
+        "baseline_retention": _retention_df(baseline),
+        "max_stage_contribution": reorder_columns(as_dataframe(_stage_rows(max_case)), STAGE_CONTRIBUTION_COLS),
+        "max_retention": _retention_df(max_case),
+        "baseline_vs_max": reorder_columns(pd.DataFrame([
+            {**baseline.summary_dict(), "comparison_label": baseline.pathway_label},
+            {**max_case.summary_dict(), "comparison_label": max_case.pathway_label},
+        ]), ["comparison_label"] + SUMMARY_COLS),
+        "phase_1_stage_long": _group_stage_long(results, "phase_1"),
+        "phase_1_stage_pivot": _group_stage_pivot(results, "phase_1", "total_stage_impact_kgco2e"),
+        "phase_1_stage_split_pivot": _group_stage_split_pivot(results, "phase_1"),
+        "phase_2_stage_long": _group_stage_long(results, "phase_2"),
+        "phase_2_stage_pivot": _group_stage_pivot(results, "phase_2", "total_stage_impact_kgco2e"),
+        "phase_2_stage_split_pivot": _group_stage_split_pivot(results, "phase_2"),
+        "carbon_negativity": carbon_negativity,
+        "parameter_selection": pd.DataFrame(SENSITIVITY_SPECS),
+    }
+
+
+def _build_temporal_outputs(results: Dict[str, PathwayResult], horizon_years: float) -> Dict[str, pd.DataFrame]:
+    temporal_summary = reorder_columns(
+        sort_by_pathway_order(as_dataframe(_temporal_metrics(r, horizon_years) for _, r in iter_results(results))),
+        TEMPORAL_SUMMARY_COLS,
+    )
+    temporal_trajectories = reorder_columns(
+        sort_by_pathway_order(pd.DataFrame([{
+            "pathway_code": r.pathway_code,
+            "pathway_label": r.pathway_label,
+            "time_year": t,
+            "stage_label": lab,
+            "retained_stock_kgco2e": s,
+            "retained_stock_tco2e": s / 1000.0,
+        } for _, r in iter_results(results) for t, s, lab in _stock_points(r)]).sort_values(["pathway_code", "time_year"]).reset_index(drop=True)),
+        TEMPORAL_TRAJECTORY_COLS,
+    )
+    return {"temporal_summary": temporal_summary, "temporal_trajectories": temporal_trajectories}
+
+
+def _build_sensitivity_outputs(constants: ModelConstants, delta: float) -> Dict[str, pd.DataFrame]:
+    baseline_result = _baseline_sensitivity_result(constants)
+    baseline_ncb = baseline_result.net_carbon_balance_kgco2e
+
+    rows = []
+    for parameter, base, run in _sensitivity_runs(constants):
+        if parameter == "Biochar fraction":
+            low_value = 0.0
+            high_value = delta * constants.biochar_retention_e3 * constants.d2_retention_at_year_25
+        else:
+            low_value = base * (1.0 - delta)
+            high_value = base * (1.0 + delta)
+
+        low, high = run(low_value), run(high_value)
+        rows.append({
+            "parameter": parameter,
+            "baseline_value": base,
+            "low_case_value": low_value,
+            "high_case_value": high_value,
+            "low_ncb_kgco2e": low.net_carbon_balance_kgco2e,
+            "high_ncb_kgco2e": high.net_carbon_balance_kgco2e,
+            "low_delta_kgco2e": low.net_carbon_balance_kgco2e - baseline_ncb,
+            "high_delta_kgco2e": high.net_carbon_balance_kgco2e - baseline_ncb,
+            "impact": max(abs(low.net_carbon_balance_kgco2e - baseline_ncb), abs(high.net_carbon_balance_kgco2e - baseline_ncb)),
+        })
+
+    sensitivity = reorder_columns(
+        pd.DataFrame(rows).sort_values("impact", ascending=False).reset_index(drop=True).assign(rank=lambda x: range(1, len(x) + 1)),
+        SENSITIVITY_COLS,
+    )
+    tornado = reorder_columns(
+        sensitivity.assign(
+            parameter_label=lambda x: x["parameter"],
+            min_delta_kgco2e=lambda x: x[["low_delta_kgco2e", "high_delta_kgco2e"]].min(axis=1),
+            max_delta_kgco2e=lambda x: x[["low_delta_kgco2e", "high_delta_kgco2e"]].max(axis=1),
+            absolute_swing_kgco2e=lambda x: x[["low_delta_kgco2e", "high_delta_kgco2e"]].abs().max(axis=1),
+        ),
+        TORNADO_COLS,
+    )
+    return {"sensitivity": sensitivity, "tornado": tornado}
+
+
+def biochar_tipping_point_analysis(
+    results: Dict[str, PathwayResult],
+    constants: ModelConstants = C,
+) -> Dict[str, Any]:
+    """Analyze how biochar retention fraction affects net carbon balance."""
+    
+    # Get the Maximum Decarbonization pathway result (or any pathway with E3)
+    base_result = results[ASPIRATIONAL_PATHWAY_CODE]
+    
+    # Get the D3 stage stock (entering E3)
+    d3_stage = base_result.get_stage("D3")
+    if d3_stage is None:
+        raise ValueError("Pathway does not contain D3 stage")
+    
+    entering_stock = d3_stage.retained_stock_kgco2e
+    
+    # Get process emissions (excluding E3 which has zero process emissions)
+    process_emissions = base_result.total_process_emissions_kgco2e
+    
+    # Initial biogenic stock
+    initial_stock = base_result.initial_biogenic_stock_kgco2e
+    
+    # Calculate NCB for different biochar retention fractions
+    retention_fractions = np.linspace(0, 1, 21)  # 0%, 5%, 10%, ..., 100%
+    results_list = []
+    
+    for retention in retention_fractions:
+        # Final retained stock = entering E3 stock × biochar retention
+        final_retained = entering_stock * retention
+        
+        # Biogenic release = initial stock - final retained
+        biogenic_release = initial_stock - final_retained
+        
+        # Net carbon balance
+        ncb = initial_stock - process_emissions - biogenic_release
+        
+        # Also calculate if it's a net sink (NCB > 0)
+        is_sink = ncb > 0
+        
+        results_list.append({
+            "biochar_retention_fraction": retention,
+            "final_retained_stock_kgco2e": final_retained,
+            "biogenic_release_kgco2e": biogenic_release,
+            "net_carbon_balance_kgco2e": ncb,
+            "is_carbon_sink": is_sink,
+            "process_emissions_kgco2e": process_emissions,
+            "initial_stock_kgco2e": initial_stock,
+        })
+    
+    df = pd.DataFrame(results_list)
+    
+    # Find the tipping point with interpolation for accuracy
+    tipping_point = None
+    for i in range(len(df) - 1):
+        ncb1 = df["net_carbon_balance_kgco2e"].iloc[i]
+        ncb2 = df["net_carbon_balance_kgco2e"].iloc[i + 1]
+        if ncb1 <= 0 <= ncb2:
+            # Linear interpolation
+            r1 = df["biochar_retention_fraction"].iloc[i]
+            r2 = df["biochar_retention_fraction"].iloc[i + 1]
+            tipping_point = r1 + (0 - ncb1) * (r2 - r1) / (ncb2 - ncb1)
+            break
+    
+    return {
+        "biochar_tipping_analysis": df,
+        "tipping_point_fraction": tipping_point,
+        "tipping_point_percent": tipping_point * 100 if tipping_point else None,
+    }
+
+def build_baseline_to_max_waterfall_df(
+    results: Dict[str, PathwayResult],
+) -> pd.DataFrame:
+    """
+    Build a waterfall decomposition from baseline A-B1-D2-E1
+    to maximum decarbonization A-B3-D3-E3 using incremental
+    parameter amendments.
+    """
+
+    baseline = results["A-B1-D2-E1"]
+    step_1 = results["A-B2-D2-E1"]
+    step_2 = results["A-B3-D2-E1"]
+    step_3 = results["A-B3-D3-E1"]
+    step_4 = results["A-B3-D3-E2"]
+    final = results["A-B3-D3-E3"]
+
+    rows = [
+        {
+            "step": "Baseline",
+            "pathway_code": "A-B1-D2-E1",
+            "ncb": baseline.net_carbon_balance_kgco2e,
+            "delta": baseline.net_carbon_balance_kgco2e,
+            "bar_type": "absolute",
+        },
+        {
+            "step": "Limited manufacturing improvement\n(B1 → B2)",
+            "pathway_code": "A-B2-D2-E1",
+            "ncb": step_1.net_carbon_balance_kgco2e,
+            "delta": step_1.net_carbon_balance_kgco2e - baseline.net_carbon_balance_kgco2e,
+            "bar_type": "delta",
+        },
+        {
+            "step": "Maximum manufacturing improvement\n(B2 → B3)",
+            "pathway_code": "A-B3-D2-E1",
+            "ncb": step_2.net_carbon_balance_kgco2e,
+            "delta": step_2.net_carbon_balance_kgco2e - step_1.net_carbon_balance_kgco2e,
+            "bar_type": "delta",
+        },
+        {
+            "step": "Service life / retention improvement\n(D2 → D3)",
+            "pathway_code": "A-B3-D3-E1",
+            "ncb": step_3.net_carbon_balance_kgco2e,
+            "delta": step_3.net_carbon_balance_kgco2e - step_2.net_carbon_balance_kgco2e,
+            "bar_type": "delta",
+        },
+        {
+            "step": "Limited end-of-life improvement\n(E1 → E2)",
+            "pathway_code": "A-B3-D3-E2",
+            "ncb": step_4.net_carbon_balance_kgco2e,
+            "delta": step_4.net_carbon_balance_kgco2e - step_3.net_carbon_balance_kgco2e,
+            "bar_type": "delta",
+        },
+        {
+            "step": "Maximum end-of-life improvement\n(E2 → E3)",
+            "pathway_code": "A-B3-D3-E3",
+            "ncb": final.net_carbon_balance_kgco2e,
+            "delta": final.net_carbon_balance_kgco2e - step_4.net_carbon_balance_kgco2e,
+            "bar_type": "delta",
+        },
+        {
+            "step": "Final: Maximum Decarbonization",
+            "pathway_code": "A-B3-D3-E3",
+            "ncb": final.net_carbon_balance_kgco2e,
+            "delta": final.net_carbon_balance_kgco2e,
+            "bar_type": "absolute",
+        },
+    ]
+
+    return pd.DataFrame(rows)
+
+def build_baseline_vs_max_difference_table(
+    results: Dict[str, PathwayResult],
+    baseline_code: str = "A-B1-D2-E1",
+    max_code: str = "A-B3-D3-E3",
+    round_digits: int = 3,
+) -> pd.DataFrame:
+    """
+    Build a comparison table quantifying differences between baseline and
+    maximum decarbonization pathways.
+
+    Outputs:
+    - Difference in net carbon balance
+    - Difference in process emissions
+    - Difference in biogenic release
+    - Difference in retained stock
+    """
+
+    baseline = results[baseline_code]
+    max_case = results[max_code]
+
+    ncb_baseline = baseline.net_carbon_balance_kgco2e
+    ncb_max = max_case.net_carbon_balance_kgco2e
+
+    process_baseline = baseline.total_process_emissions_kgco2e
+    process_max = max_case.total_process_emissions_kgco2e
+
+    release_baseline = baseline.total_biogenic_release_kgco2e
+    release_max = max_case.total_biogenic_release_kgco2e
+
+    retained_baseline = baseline.final_retained_stock_kgco2e
+    retained_max = max_case.final_retained_stock_kgco2e
+
+    diff_ncb = ncb_max - ncb_baseline
+    diff_process = process_baseline - process_max
+    diff_release = release_baseline - release_max
+    diff_retained = retained_max - retained_baseline
+
+    return pd.DataFrame([
+        {
+            "metric": "Net carbon balance (NCB)",
+            "baseline": round(ncb_baseline, round_digits),
+            "max_decarb": round(ncb_max, round_digits),
+            "difference": round(diff_ncb, round_digits),
+        },
+        {
+            "metric": "Process emissions",
+            "baseline": round(process_baseline, round_digits),
+            "max_decarb": round(process_max, round_digits),
+            "difference": round(diff_process, round_digits),
+        },
+        {
+            "metric": "Biogenic release",
+            "baseline": round(release_baseline, round_digits),
+            "max_decarb": round(release_max, round_digits),
+            "difference": round(diff_release, round_digits),
+        },
+        {
+            "metric": "Retained stock",
+            "baseline": round(retained_baseline, round_digits),
+            "max_decarb": round(retained_max, round_digits),
+            "difference": round(diff_retained, round_digits),
+        },
+    ])
+
+
+def _build_uncertainty_outputs(
+    results: Dict[str, PathwayResult],
+    constants: ModelConstants,
+    delta: float,
+    temporal_summary: pd.DataFrame,
+) -> Dict[str, pd.DataFrame]:
+    baseline_ncb = _baseline_sensitivity_result(constants).net_carbon_balance_kgco2e
+    worst = _baseline_sensitivity_result(
+        constants,
+        electricity_ef=constants.electricity_kgco2e_per_kwh * (1 + delta),
+        resin_fraction=constants.resin_fraction * (1 + delta),
+        manufacturing_energy_multiplier=1 + delta,
+        transport_emissions_multiplier=1 + delta,
+        retention_at_year_25=constants.d2_retention_at_year_25 * (1 - delta),
+        biochar_fraction=0.0,
+    ).net_carbon_balance_kgco2e
+    best = _baseline_sensitivity_result(
+        constants,
+        electricity_ef=constants.electricity_kgco2e_per_kwh * (1 - delta),
+        resin_fraction=constants.resin_fraction * (1 - delta),
+        manufacturing_energy_multiplier=1 - delta,
+        transport_emissions_multiplier=1 - delta,
+        retention_at_year_25=constants.d2_retention_at_year_25 * (1 + delta),
+        biochar_fraction=delta * constants.biochar_retention_e3 * constants.d2_retention_at_year_25,
+    ).net_carbon_balance_kgco2e
+
+    uncertainty = reorder_columns(pd.DataFrame([
+        {"scenario_group": "Combined uncertainty envelope", "scenario": "Baseline", "pathway": BASELINE_PATHWAY_CODE, "net_carbon_balance_kgco2e": baseline_ncb, "delta_vs_baseline_kgco2e": 0.0},
+        {"scenario_group": "Combined uncertainty envelope", "scenario": "Combined worst-case", "pathway": BASELINE_PATHWAY_CODE, "net_carbon_balance_kgco2e": worst, "delta_vs_baseline_kgco2e": worst - baseline_ncb},
+        {"scenario_group": "Combined uncertainty envelope", "scenario": "Combined best-case", "pathway": BASELINE_PATHWAY_CODE, "net_carbon_balance_kgco2e": best, "delta_vs_baseline_kgco2e": best - baseline_ncb},
+    ]).round(4), UNCERTAINTY_COLS)
+
+    aspirational = reorder_columns(pd.DataFrame([
+        {"scenario_group": "Pathway comparison", "scenario": "Baseline", "pathway": BASELINE_PATHWAY_CODE, "net_carbon_balance_kgco2e": results[BASELINE_PATHWAY_CODE].net_carbon_balance_kgco2e, "delta_vs_baseline_kgco2e": 0.0},
+        {"scenario_group": "Pathway comparison", "scenario": "Aspirational best-case pathway", "pathway": ASPIRATIONAL_PATHWAY_CODE, "net_carbon_balance_kgco2e": results[ASPIRATIONAL_PATHWAY_CODE].net_carbon_balance_kgco2e, "delta_vs_baseline_kgco2e": results[ASPIRATIONAL_PATHWAY_CODE].net_carbon_balance_kgco2e - results[BASELINE_PATHWAY_CODE].net_carbon_balance_kgco2e},
+    ]).round(4), UNCERTAINTY_COLS)
+
+    combined_uncertainty = pd.concat([uncertainty, aspirational], ignore_index=True)
+    combined_uncertainty["interpretation_label"] = combined_uncertainty["net_carbon_balance_kgco2e"].map(
+        lambda x: "Carbon negative" if x > 0.05 else ("Carbon positive" if x < -0.05 else "Near carbon neutral")
+    )
+
+    tipping = _group_summary(results, "phase_2")[["pathway_code", "pathway_label", "net_carbon_balance_kgco2e"]].merge(
+        temporal_summary[["pathway_code", "temporal_storage_benefit_tco2e_year", "average_retained_stock_tco2e"]],
+        on="pathway_code",
+        how="left",
+    ).rename(columns={"pathway_code": "pathway", "pathway_label": "scenario", "net_carbon_balance_kgco2e": "NCB_relocation"})
+    assert_unique_columns(tipping, "tipping")
+    tipping = reorder_columns(
+        tipping.assign(carbon_negative=lambda x: x["NCB_relocation"] > 0).sort_values("NCB_relocation", ascending=False).reset_index(drop=True).assign(rank=lambda x: range(1, len(x) + 1)),
+        TIPPING_POINT_COLS,
+    )
+
+    return {
+        "uncertainty": uncertainty,
+        "aspirational_best_case": aspirational,
+        "combined_uncertainty": combined_uncertainty,
+        "tipping": tipping,
+    }
+
+
+def build_outputs(
+    results: Dict[str, PathwayResult],
+    constants: ModelConstants = C,
+    horizon_years: float = DEFAULT_TIME_HORIZON_YEARS,
+    delta: float = DEFAULT_SENSITIVITY_DELTA,
+) -> Dict[str, pd.DataFrame]:
+    reporting = _build_reporting_outputs(results)
+    temporal = _build_temporal_outputs(results, horizon_years)
+    sensitivity = _build_sensitivity_outputs(constants, delta)
+    uncertainty = _build_uncertainty_outputs(results, constants, delta, temporal["temporal_summary"])
+    tipping_analysis = biochar_tipping_point_analysis(results, constants)
+    baseline_vs_max_difference = build_baseline_vs_max_difference_table(results)
+    baseline_to_max_waterfall = build_baseline_to_max_waterfall_df(results)
+    
+    return {
+        **reporting,
+        **temporal,
+        **sensitivity,
+        **uncertainty,
+        **tipping_analysis,
+        "baseline_vs_max_difference": baseline_vs_max_difference,
+        "baseline_to_max_waterfall": baseline_to_max_waterfall
+    }
+
+
+def max_decarb_sensitivity_runs(
+    constants: ModelConstants = C
+) -> List[Tuple[str, float, float, float, Callable[[float], PathwayResult]]]:
+    """
+    Define sensitivity parameters for Maximum Decarbonization pathway.
+    Returns: (parameter_name, min_value, baseline_value, max_value, function_to_run)
+    """
+    sensitivity_params = []
+
+    for spec in _get_max_decarb_parameter_specs(constants):
+        sensitivity_params.append((
+            spec["name"],
+            spec["min"],
+            spec["base"],
+            spec["max"],
+            lambda v, p=spec["param"]: run_pathway(
+                ASPIRATIONAL_PATHWAY_CODE,
+                _apply_max_decarb_parameter(constants, p, v),
+            ),
+        ))
+
+    return sensitivity_params
+
+def run_max_decarb_sensitivity_analysis(
+    constants: ModelConstants = C, 
+    n_points: int = 20
+) -> Dict[str, pd.DataFrame]:
+    """
+    Return sweep dataframes for each maximum-decarbonization parameter
+    """
+    evaluated = evaluate_max_decarb_parameters(constants, n_points=n_points)
+    return {name: payload["sweep_df"] for name, payload in evaluated.items()}
+    
+
+def build_max_decarb_tornado_data(
+    constants: ModelConstants = C,
+    evaluated: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> pd.DataFrame:
+    """
+    Build tornado input data for the Maximum Decarbonization pathway
+    from shared parameter evaluations.
+    """
+    if evaluated is None:
+        evaluated = evaluate_max_decarb_parameters(constants)
+
+    rows = []
+
+    for param_name, payload in evaluated.items():
+        spec = payload["spec"]
+        min_result = payload["min_result"]
+        max_result = payload["max_result"]
+        base_ncb = payload["base_ncb"]
+
+        min_val = spec["min"]
+        base_val = spec["base"]
+        max_val = spec["max"]
+        lower_is_better = spec["lower_is_better"]
+
+        min_ncb = min_result.net_carbon_balance_kgco2e
+        max_ncb = max_result.net_carbon_balance_kgco2e
+
+        min_delta = min_ncb - base_ncb
+        max_delta = max_ncb - base_ncb
+
+        if lower_is_better:
+            better_delta = min_delta
+            worse_delta = max_delta
+            better_label = f"Min: {min_val:.3f}"
+            worse_label = f"Max: {max_val:.3f}"
+        else:
+            better_delta = max_delta
+            worse_delta = min_delta
+            better_label = f"Max: {max_val:.3f}"
+            worse_label = f"Min: {min_val:.3f}"
+
+        rows.append({
+            "parameter": param_name,
+            "param": spec["param"],
+            "base_ncb": base_ncb,
+            "base_val": base_val,
+            "min_val": min_val,
+            "max_val": max_val,
+            "min_ncb": min_ncb,
+            "max_ncb": max_ncb,
+            "min_delta": min_delta,
+            "max_delta": max_delta,
+            "better_delta": better_delta,
+            "worse_delta": worse_delta,
+            "better_label": better_label,
+            "worse_label": worse_label,
+            "impact": abs(worse_delta) + abs(better_delta),
+            "lower_is_better": lower_is_better,
+            "note": spec.get("note", ""),
+        })
+
+    return pd.DataFrame(rows).sort_values("impact", ascending=True).reset_index(drop=True)
+
+
+def evaluate_max_decarb_parameters(
+    constants: ModelConstants = C,
+    n_points: int = 20,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Evaluate all max-decarbonization parameters once and return both:
+    - sweep data across the full range
+    - min/base/max endpoint results for tornado-style summaries
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+
+    base_result = run_pathway(ASPIRATIONAL_PATHWAY_CODE, constants)
+    base_ncb = base_result.net_carbon_balance_kgco2e
+
+    for spec in _get_max_decarb_parameter_specs(constants):
+        param_name = spec["name"]
+        param_key = spec["param"]
+        min_val = spec["min"]
+        base_val = spec["base"]
+        max_val = spec["max"]
+
+        # Endpoint runs
+        min_constants = _apply_max_decarb_parameter(constants, param_key, min_val)
+        max_constants = _apply_max_decarb_parameter(constants, param_key, max_val)
+
+        min_result = run_pathway(ASPIRATIONAL_PATHWAY_CODE, min_constants)
+        max_result = run_pathway(ASPIRATIONAL_PATHWAY_CODE, max_constants)
+
+        # Sweep runs
+        sweep_rows = []
+        for val in np.linspace(min_val, max_val, n_points):
+            result = run_pathway(
+                ASPIRATIONAL_PATHWAY_CODE,
+                _apply_max_decarb_parameter(constants, param_key, float(val)),
+            )
+            sweep_rows.append({
+                "parameter_value": float(val),
+                "net_carbon_balance": result.net_carbon_balance_kgco2e,
+                "final_retained_stock": result.final_retained_stock_kgco2e,
+                "process_emissions": result.total_process_emissions_kgco2e,
+                "biogenic_release": result.total_biogenic_release_kgco2e,
+                "is_carbon_sink": result.net_carbon_balance_kgco2e > 0,
+            })
+
+        out[param_name] = {
+            "spec": spec,
+            "base_ncb": base_ncb,
+            "min_result": min_result,
+            "max_result": max_result,
+            "sweep_df": pd.DataFrame(sweep_rows),
+        }
+
+    return out
+
+
+
+# =========================================================
+# BLOCK 7 — PLOTTING MAP
+# =========================================================
+
+CHART_SPECS = {
+    "baseline_stage_contribution": {
+        "title": "Baseline stage contribution analysis",
+        "filename": "baseline_stage_contribution.png",
+    },
+    "tornado": {
+        "title": "Sensitivity analysis tornado chart",
+        "filename": "tornado_chart.png",
+    },
+    "phase_1_summary": {
+        "title": "Phase 1 scenario comparison: Japan disposal vs relocation",
+        "filename": "phase_1_summary.png",
+    },
+    "phase_1_tonne_year": {
+        "title": "Phase 1 comparison: tonne-year benefits",
+        "filename": "phase_1_tonne_year.png",
+    },
+    "phase_2_stage_breakdown": {
+        "title": "Phase 2 comparison: per-stage process emissions and biogenic release",
+        "filename": "phase_2_stage_breakdown.png",
+    },
+    "phase_2_net_balance": {
+        "title": "Phase 2 comparison: net carbon balance across decarbonization pathways",
+        "filename": "phase_2_net_balance.png",
+    },
+    "phase_2_tonne_year": {
+        "title": "Phase 2 comparison: tonne-year benefits",
+        "filename": "phase_2_tonne_year.png",
+    },
+    "uncertainty_vs_aspirational": {
+        "title": "Baseline uncertainty envelope vs aspirational best-case pathway",
+        "filename": "baseline_uncertainty_vs_aspirational.png",
+    },
+    "biochar_tipping_point": {
+        "title": "Biochar Retention: The Tipping Point for Carbon Storage",
+        "filename": "biochar_tipping_point.png",
+    },
+    "baseline_to_max_waterfall": {
+        "title": "Baseline to Maximum Decarbonization: amendment waterfall",
+        "filename": "baseline_to_max_waterfall.png",
+    },
+    "max_decarb_sensitivity": {
+        "title": "Maximum Decarbonization Pathway Sensitivity Analysis",
+        "filename": "max_decarb_sensitivity.png",
+    },
+    "max_decarb_tornado": {
+        "title": "Maximum Decarbonization: Parameter Impact Tornado",
+        "filename": "max_decarb_tornado.png",
+    },
+    "baseline_vs_max_difference": {
+        "title": "Baseline vs maximum decarbonization",
+        "filename": "baseline_vs_max_difference.png",
+    },
+    "feasibility_impact_matrix": {
+    "title": "Feasibility-Impact Matrix: Prioritising Decarbonization Levers",
+    "filename": "feasibility_impact_matrix.png",
+    },
+}
+
+def print_chart_titles(chart_ids: Optional[List[str]] = None) -> None:
+    ids = chart_ids or list(CHART_SPECS)
+    print("\nFIGURE TITLES")
+    print("=============")
+    for chart_id in ids:
+        spec = CHART_SPECS[chart_id]
+        print(f"{chart_id}: {spec['title']}")
+
+
+def get_chart_title_map(chart_ids: Optional[List[str]] = None) -> pd.DataFrame:
+    ids = chart_ids or list(CHART_SPECS)
+    return pd.DataFrame(
+        [
+            {
+                "chart_id": cid,
+                "title": CHART_SPECS[cid]["title"],
+                "filename": CHART_SPECS[cid]["filename"],
+            }
+            for cid in ids
+        ]
+    )
+
+
+def _finish_plot(
+    fig: plt.Figure,
+    filename: Optional[str] = None,
+    show: bool = True,
+    *,
+    use_tight_layout: bool = True,
+) -> Optional[Path]:
+    if use_tight_layout:
+        fig.tight_layout()
+    saved_path = save_figure(filename)
+    plt.show() if show else plt.close(fig)
+    return saved_path
+
+
+def _bar(
+    labels: List[str],
+    values: np.ndarray,
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    rotation: int = 0,
+    ha: str = "center",
+    filename: Optional[str] = None,
+    show: bool = True,
+    horizontal: bool = False,
+) -> Optional[Path]:
+    if not labels:
+        return None
+
+    fig, ax = plt.subplots()
+    x = np.arange(len(labels))
+
+    if horizontal:
+        ax.barh(x, values)
+        ax.set_yticks(x)
+        ax.set_yticklabels(labels)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.axvline(0, linewidth=0.8)
+    else:
+        ax.bar(x, values)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, rotation=rotation, ha=ha)
+        ax.axhline(0, linewidth=0.8)
+
+    return _finish_plot(fig, filename, show)
+
+
+def _grouped(
+    labels: List[str],
+    series: List[Tuple[str, np.ndarray]],
+    *,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    width: float = 0.18,
+    rotation: int = 0,
+    ha: str = "center",
+    filename: Optional[str] = None,
+    show: bool = True,
+    colors: Optional[Dict[str, str]] = None,
+) -> Optional[Path]:
+    if not labels or not series:
+        return None
+
+    fig, ax = plt.subplots()
+    x = np.arange(len(labels))
+    offsets = np.linspace(-(len(series) - 1) / 2, (len(series) - 1) / 2, len(series)) * width
+
+    for off, (name, vals) in zip(offsets, series):
+        ax.bar(x + off, vals, width=width, label=name, color=(colors.get(name) if colors else None))
+
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=rotation, ha=ha)
+    ax.axhline(0, linewidth=0.8)
+    ax.legend(fontsize=ANNOTATION_FONT_SIZE, loc="lower center", bbox_to_anchor=(0.5, 1.10), ncol=2)
+
+    return _finish_plot(fig, filename, show)
+
+
+def _tornado(
+    df: pd.DataFrame,
+    *,
+    title: str,
+    filename: Optional[str] = None,
+    show: bool = True,
+) -> Optional[Path]:
+    if df.empty:
+        return None
+
+    d = df.sort_values("absolute_swing_kgco2e").reset_index(drop=True)
+    left = np.minimum(d["min_delta_kgco2e"].to_numpy(), d["max_delta_kgco2e"].to_numpy())
+    width = np.abs(d["max_delta_kgco2e"].to_numpy() - d["min_delta_kgco2e"].to_numpy())
+
+    fig, ax = plt.subplots()
+    y = np.arange(len(d))
+    ax.barh(y, width, left=left)
+    ax.set_yticks(y)
+    ax.set_yticklabels(d["parameter_label"].tolist())
+    ax.set_xlabel("Change in net carbon balance (kgCO2e)")
+    ax.set_title(title)
+    ax.axvline(0, linewidth=0.8)
+
+    return _finish_plot(fig, filename, show)
+
+
+def _phase_1_summary(
+    df: pd.DataFrame,
+    *,
+    title: str,
+    filename: Optional[str] = None,
+    show: bool = True,
+) -> Optional[Path]:
+    if df.empty:
+        return None
+
+    d = df.copy()
+    d["scenario"] = pd.Categorical(
+        d["scenario"],
+        categories=["Japan disposal", "Relocation"],
+        ordered=True,
+    )
+    d = d.sort_values("scenario").reset_index(drop=True)
+
+    labels = d["scenario"].tolist()
+    process = d["total_process_emissions_kgco2e"].to_numpy()
+    biogenic = d["total_biogenic_release_kgco2e"].to_numpy()
+    net = d["net_carbon_balance_kgco2e"].to_numpy()
+
+    fig, ax = plt.subplots()
+    x = np.arange(len(labels))
+    width = 0.22
+
+    b1 = ax.bar(x - width, process, width=width, label="Process emissions")
+    b2 = ax.bar(x, biogenic, width=width, label="Biogenic release")
+    b3 = ax.bar(x + width, net, width=width, label="Net carbon balance")
+
+    ax.set_xlabel("Scenario")
+    ax.set_ylabel("kg CO2e per kg bamboo scrimber")
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.axhline(0, linewidth=0.8)
+    ax.legend(fontsize=ANNOTATION_FONT_SIZE)
+    ax.set_ylim(min(net) - 0.15, max(biogenic) + 0.25)
+
+    for bars in (b1, b2, b3):
+        for bar in bars:
+            h = bar.get_height()
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                h + (0.02 if h >= 0 else -0.04),
+                f"{h:.3f}",
+                ha="center",
+                va="bottom" if h >= 0 else "top",
+                fontsize=ANNOTATION_FONT_SIZE,
+            )
+
+    if len(process) == 2:
+        delta = process[1] - process[0]
+        y = max(process) + 0.10
+        ax.plot([x[0] - width, x[1] - width], [y, y], linewidth=1.0)
+        ax.text(
+            np.mean([x[0] - width, x[1] - width]),
+            y + 0.015,
+            f"Relocation adds {delta:.3f} kg CO2e process emissions",
+            ha="center",
+            va="bottom",
+            fontsize=ANNOTATION_FONT_SIZE,
+        )
+
+    return _finish_plot(fig, filename, show)
+
+
+def plot_biochar_tipping_point(
+    df: pd.DataFrame,
+    tipping_point: Optional[float],
+    *,
+    title: str,
+    filename: Optional[str] = None,
+    show: bool = True,
+) -> Optional[Path]:
+    fig, ax = plt.subplots()
+
+    retention = df["biochar_retention_fraction"].to_numpy()
+    ncb = df["net_carbon_balance_kgco2e"].to_numpy()
+
+    ax.plot(retention * 100, ncb, "b-", linewidth=2, label="Net carbon balance")
+    ax.axhline(0, color="red", linestyle="--", linewidth=1, label="Carbon neutral (source/sink boundary)")
+
+    if tipping_point is not None:
+        ax.axvline(
+            tipping_point * 100,
+            color="green",
+            linestyle=":",
+            linewidth=2,
+            label=f"Tipping point: {tipping_point * 100:.1f}% retention",
+        )
+        ax.annotate(
+            f"Carbon sink above {tipping_point * 100:.1f}%",
+            xy=(tipping_point * 100, 0),
+            xytext=(tipping_point * 100 + 10, 0.2),
+            arrowprops=dict(arrowstyle="->", color="green"),
+            fontsize=ANNOTATION_FONT_SIZE,
+        )
+
+    ax.fill_between(retention * 100, 0, ncb, where=(ncb >= 0), color="green", alpha=0.3, label="Carbon sink (net storage)")
+    ax.fill_between(retention * 100, 0, ncb, where=(ncb < 0), color="red", alpha=0.3, label="Carbon source (net emission)")
+
+    ax.set_xlabel("Biochar retention fraction (%)")
+    ax.set_ylabel("Net carbon balance (kg CO2e per functional unit)")
+    ax.set_title(title)
+    ax.legend(loc="best", fontsize=ANNOTATION_FONT_SIZE)
+    ax.grid(True, alpha=0.3)
+
+    return _finish_plot(fig, filename, show)
+
+
+def plot_max_decarb_sensitivity_chart(
+    constants: ModelConstants = C,
+    sensitivity_results: Optional[Dict[str, pd.DataFrame]] = None,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "max_decarb_sensitivity.png",
+) -> Optional[Path]:
+    if sensitivity_results is None:
+        sensitivity_results = run_max_decarb_sensitivity_analysis(constants)
+
+    parameter_specs = _get_max_decarb_parameter_specs(constants)
+    base_result = run_pathway(ASPIRATIONAL_PATHWAY_CODE, constants)
+    base_ncb = base_result.net_carbon_balance_kgco2e
+
+    n_params = len(parameter_specs)
+    n_cols = 2
+    n_rows = (n_params + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(10.5, 3.8 * n_rows))
+    axes = axes.flatten() if n_params > 1 else [axes]
+
+    for idx, param_info in enumerate(parameter_specs):
+        ax = axes[idx]
+        param_name = param_info["name"]
+        baseline_x = param_info["base"]
+
+        df = sensitivity_results.get(param_name, pd.DataFrame())
+        if df.empty:
+            ax.set_visible(False)
+            continue
+
+        values = df["parameter_value"].to_numpy()
+        ncb_array = df["net_carbon_balance"].to_numpy()
+
+        ax.plot(values, ncb_array, "b-", linewidth=2, marker="o", markersize=3)
+        ax.axhline(base_ncb, color="gray", linestyle="--", linewidth=1, alpha=0.7, label=f"Base: {base_ncb:.3f}")
+        ax.axhline(0, color="green", linestyle=":", linewidth=1, alpha=0.7, label="Carbon neutral")
+
+        baseline_idx = np.argmin(np.abs(values - baseline_x))
+        ax.plot(values[baseline_idx], ncb_array[baseline_idx], "ro", markersize=6, label=f"Baseline: {baseline_x:.3f}")
+
+        ax.fill_between(values, 0, ncb_array, where=(ncb_array >= 0), color="green", alpha=0.2)
+        ax.fill_between(values, 0, ncb_array, where=(ncb_array < 0), color="red", alpha=0.2)
+
+        for i in range(len(ncb_array) - 1):
+            if ncb_array[i] <= 0 <= ncb_array[i + 1] or ncb_array[i] >= 0 >= ncb_array[i + 1]:
+                v1, v2 = values[i], values[i + 1]
+                n1, n2 = ncb_array[i], ncb_array[i + 1]
+                if n2 != n1:
+                    crossing = v1 + (0 - n1) * (v2 - v1) / (n2 - n1)
+                    ax.axvline(
+                        crossing,
+                        color="orange",
+                        linestyle="--",
+                        linewidth=1,
+                        alpha=0.7,
+                        label=f"Tipping: {crossing:.3f}",
+                    )
+                break
+
+        ax.set_xlabel(param_name)
+        ax.set_ylabel("Net carbon balance (kg CO2e)")
+        ax.set_title(param_name)
+        ax.legend(loc="best", fontsize=ANNOTATION_FONT_SIZE)
+        ax.grid(True, alpha=0.3)
+
+    for idx in range(len(parameter_specs), len(axes)):
+        axes[idx].set_visible(False)
+
+    fig.suptitle(
+        f"{title}\nBase NCB = {base_ncb:.3f} kg CO2e",
+        fontweight="bold",
+        fontsize=TITLE_FONT_SIZE
+    )
+
+    return _finish_plot(fig, filename, show)
+
+
+def plot_max_decarb_tornado(
+    constants: ModelConstants = C,
+    tornado_df: Optional[pd.DataFrame] = None,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "max_decarb_tornado.png",
+) -> Optional[Path]:
+    if tornado_df is None:
+        tornado_df = build_max_decarb_tornado_data(constants)
+
+    if tornado_df.empty:
+        return None
+
+    df = tornado_df.copy()
+    base_ncb = df["base_ncb"].iloc[0]
+
+    fig, ax = plt.subplots(figsize=(10.5, 7))
+    x_min = -0.65
+    x_max = 0.35
+    ax.set_xlim(x_min, x_max)
+    padding = 0.04
+
+    y_pos = np.arange(len(df))
+
+    for i, (_, row) in enumerate(df.iterrows()):
+        worse_width = abs(row["worse_delta"])
+        worse_start = min(0, row["worse_delta"])
+        if worse_start < x_min:
+            worse_start = x_min
+        if worse_start + worse_width > 0:
+            worse_width = 0 - worse_start
+
+        ax.barh(
+            i,
+            worse_width,
+            left=worse_start,
+            color="#cd5c5c",
+            alpha=0.85,
+            edgecolor="#8b0000",
+            linewidth=0.8,
+        )
+
+        better_width = abs(row["better_delta"])
+        better_start = 0
+        if better_start + better_width > x_max:
+            better_width = x_max - better_start
+
+        ax.barh(
+            i,
+            better_width,
+            left=better_start,
+            color="#4682b4",
+            alpha=0.85,
+            edgecolor="#00008b",
+            linewidth=0.8,
+        )
+
+        if row["worse_delta"] != 0 and row["worse_delta"] > x_min + 0.05:
+            label_x = max(x_min + padding, row["worse_delta"] - 0.04)
+            ax.text(
+                label_x,
+                i,
+                f"{row['worse_delta']:+.3f}",
+                ha="right" if row["worse_delta"] < -0.05 else "left",
+                va="center",
+                fontsize=ANNOTATION_FONT_SIZE,
+                color="#8b0000",
+                fontweight="bold",
+            )
+        elif row["worse_delta"] != 0:
+            ax.text(
+                x_min + padding,
+                i,
+                f"{row['worse_delta']:+.3f}",
+                ha="left",
+                va="center",
+                fontsize=ANNOTATION_FONT_SIZE,
+                color="#8b0000",
+            )
+
+        if row["better_delta"] != 0 and row["better_delta"] < x_max - 0.05:
+            label_x = min(x_max - padding, row["better_delta"] + 0.04)
+            ax.text(
+                label_x,
+                i,
+                f"+{row['better_delta']:.3f}",
+                ha="left" if row["better_delta"] > 0.05 else "right",
+                va="center",
+                fontsize=ANNOTATION_FONT_SIZE,
+                color="#00008b",
+                fontweight="bold",
+            )
+        elif row["better_delta"] != 0:
+            ax.text(
+                x_max - padding,
+                i,
+                f"+{row['better_delta']:.3f}",
+                ha="right",
+                va="center",
+                fontsize=ANNOTATION_FONT_SIZE,
+                color="#00008b",
+            )
+
+        if "grid carbon intensity" in row["parameter"].lower():
+            provincial_grid_intensities = {
+                "National avg": 0.6096,
+                "Yunnan": 0.1333,
+                "Tianjin": 0.6796,
+                "Guangdong": 0.4419,
+                "Sichuan": 0.1564,
+            }
+
+            min_val = row["min_val"]
+            max_val = row["max_val"]
+            min_delta = row["min_delta"]
+            max_delta = row["max_delta"]
+
+            if max_val != min_val:
+                provincial_grid_intensities = {
+                    "National avg": 0.6096,
+                    "Yunnan": 0.1333,
+                    "Tianjin": 0.6796,
+                    "Guangdong": 0.4419,
+                    "Sichuan": 0.1564,
+                }
+
+                left_label_x = x_min + 0.16
+                right_label_x = x_max - 0.03
+
+                province_label_positions = {
+                    "Tianjin":      (left_label_x,  i - 0.30, "right"),
+                    "National avg": (left_label_x,  i + 0.28, "right"),
+                    "Guangdong":    (left_label_x,  i + 0.10, "right"),
+                    "Sichuan":      (right_label_x, - 0.02, i + 0.60, "right"),
+                    "Yunnan":       (right_label_x, i + 0.80, "right"),
+                }
+
+                for province, grid_value in provincial_grid_intensities.items():
+                    province_delta = min_delta + (
+                        (grid_value - min_val) / (max_val - min_val)
+                    ) * (max_delta - min_delta)
+
+                    ax.plot(
+                        province_delta,
+                        i,
+                        "o",
+                        markersize=7,
+                        markeredgecolor="black",
+                        markeredgewidth=0.8,
+                        zorder=15,
+                    )
+
+                    x_text, y_text, ha = province_label_positions[province]
+
+                    ax.annotate(
+                        f"{province}: {grid_value:.4f}",
+                        xy=(province_delta, i),
+                        xytext=(x_text, y_text),
+                        ha=ha,
+                        va="center",
+                        fontsize=ANNOTATION_FONT_SIZE,
+                        arrowprops=dict(
+                            arrowstyle="-",
+                            color="black",
+                            lw=0.8,
+                            alpha=1.0,
+                            shrinkA=0,
+                            shrinkB=0,
+                        ),
+                        zorder=20,
+                    )
+
+    ax.axvline(0, color="black", linewidth=2, linestyle="-")
+    ax.grid(axis="x", alpha=0.25, linestyle="--", linewidth=0.5)
+    ax.set_axisbelow(True)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(df["parameter"].tolist())
+    ax.tick_params(axis="y", left=True, right=False)
+
+    ax.set_xlabel(
+        "Change in net carbon balance (kg CO2e) from base case",
+        fontsize=ANNOTATION_FONT_SIZE,
+        fontweight="medium",
+    )
+    ax.xaxis.grid(True, alpha=0.3, linestyle="--")
+
+    ax.set_title(
+        f"{title}\nBase NCB = {base_ncb:.3f} kg CO2e",
+        fontsize=TITLE_FONT_SIZE,
+        fontweight="bold",
+        pad=15,
+    )
+
+    from matplotlib.patches import Patch
+
+    legend_elements = [
+        Patch(facecolor="#cd5c5c", alpha=0.85, edgecolor="#8b0000", label="Worsens NCB"),
+        Patch(facecolor="#4682b4", alpha=0.85, edgecolor="#00008b", label="Improves NCB"),
+    ]
+    ax.legend(
+        handles=legend_elements,
+        loc="lower right",
+        fontsize=ANNOTATION_FONT_SIZE,
+        framealpha=1,
+        shadow=False,
+    )
+
+    return _finish_plot(fig, filename, show)
+
+
+def plot_baseline_to_max_waterfall(
+    df: pd.DataFrame,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "baseline_to_max_waterfall.png",
+) -> Optional[Path]:
+    if df.empty:
+        return None
+
+    values = df["delta"].to_list()
+    labels = df["step"].to_list()
+    bar_types = df["bar_type"].to_list()
+
+    bottoms = []
+    running = 0.0
+
+    for i, (value, bar_type) in enumerate(zip(values, bar_types)):
+        if i == 0 or i == len(values) - 1 or bar_type == "absolute":
+            bottoms.append(0.0)
+            if i == 0:
+                running = df.loc[i, "ncb"]
+        else:
+            if value >= 0:
+                bottoms.append(running)
+            else:
+                bottoms.append(running + value)
+            running += value
+
+    fig, ax = plt.subplots(figsize=(10.5, 7.0))
+    x = np.arange(len(labels))
+
+    colors = []
+    for i, v in enumerate(values):
+        if i == 0 or i == len(values) - 1:
+            colors.append("#4c78a8")
+        elif v >= 0:
+            colors.append("#59a14f")
+        else:
+            colors.append("#e15759")
+
+    bars = ax.bar(x, values, bottom=bottoms, color=colors)
+
+    running = df.loc[0, "ncb"]
+    for i in range(1, len(values) - 1):
+        ax.plot([i - 1 + 0.4, i - 0.4], [running, running], color="gray", linewidth=0.8)
+        running += values[i]
+
+    bar_tops = [bottom + value for bottom, value in zip(bottoms, values)]
+    y_min = min(0.0, min(bottoms), min(bar_tops))
+    y_max = max(0.0, max(bottoms), max(bar_tops))
+
+    y_range = y_max - y_min
+    top_padding = max(0.08, 0.12 * y_range)
+    bottom_padding = max(0.04, 0.04 * y_range)
+
+    ax.set_ylim(y_min - bottom_padding, y_max + top_padding)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.tick_params(axis="x", pad=8)
+    ax.set_ylabel("Net carbon balance (kg CO2e per functional unit)")
+    ax.set_title(title)
+
+    for i, bar in enumerate(bars):
+        height = values[i]
+        y_top = bottoms[i] + height
+        label = f"{height:.3f}" if i in [0, len(values) - 1] else f"{height:+.3f}"
+
+        if height >= 0:
+            text_y = y_top + 0.03
+            va = "bottom"
+        else:
+            text_y = y_top + 0.06
+            va = "bottom"
+
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            text_y,
+            label,
+            ha="center",
+            va=va,
+            fontsize=ANNOTATION_FONT_SIZE,
+        )
+
+    plt.subplots_adjust(bottom=0.28)
+    return _finish_plot(fig, filename, show, use_tight_layout=False)
+
+
+def plot_baseline_stage_contribution(
+    baseline_stage_df: pd.DataFrame,
+    summary_df: pd.DataFrame,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "baseline_stage_contribution.png",
+) -> Optional[Path]:
+    if baseline_stage_df.empty:
+        return None
+
+    baseline_summary = summary_df[summary_df["pathway_code"] == BASELINE_PATHWAY_CODE]
+    net_carbon_balance = baseline_summary["net_carbon_balance_kgco2e"].values[0] if not baseline_summary.empty else 0.0
+
+    stage_labels = baseline_stage_df["stage_code"].tolist()
+    process_vals = baseline_stage_df["process_emissions_kgco2e"].to_numpy()
+    biogenic_vals = baseline_stage_df["biogenic_release_kgco2e"].to_numpy()
+
+    fig, ax = plt.subplots()
+    x = np.arange(len(stage_labels))
+    width = 0.35
+
+    bars1 = ax.bar(x - width / 2, process_vals, width, label="Process emissions", color="#4682b4")
+    bars2 = ax.bar(x + width / 2, biogenic_vals, width, label="Biogenic release", color="#cd5c5c")
+
+    ax.set_xlabel("Stage")
+    ax.set_ylabel("kg CO2e per functional unit")
+    ax.set_title(f"{title}\nNet carbon balance: {net_carbon_balance:.3f} kg CO2e")
+    ax.set_xticks(x)
+    ax.set_xticklabels(stage_labels)
+    ax.legend(loc="upper right", fontsize=ANNOTATION_FONT_SIZE)
+    ax.axhline(0, linewidth=0.8, color="black", linestyle="-")
+
+    y_max = max(max(process_vals), max(biogenic_vals))
+    y_min = min(min(process_vals), min(biogenic_vals), 0)
+    y_range = y_max - y_min
+    ax.set_ylim(y_min - y_range * 0.05, y_max + y_range * 0.10)
+
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            va = "bottom" if height >= 0 else "top"
+            offset = 0.02 if height >= 0 else -0.04
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                height + offset,
+                f"{height:.3f}",
+                ha="center",
+                va=va,
+                fontsize=ANNOTATION_FONT_SIZE,
+            )
+
+    return _finish_plot(fig, filename, show)
+
+
+def plot_uncertainty_vs_aspirational(
+    uncertainty_df: pd.DataFrame,
+    aspirational_df: pd.DataFrame,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "baseline_uncertainty_vs_aspirational.png",
+) -> Optional[Path]:
+    asp = aspirational_df[aspirational_df["scenario"] == "Aspirational best-case pathway"]
+
+    df = pd.concat(
+        [
+            uncertainty_df[["scenario", "net_carbon_balance_kgco2e"]],
+            asp[["scenario", "net_carbon_balance_kgco2e"]],
+        ],
+        ignore_index=True,
+    )
+
+    assert_unique_columns(df, "uncertainty_vs_aspirational")
+
+    desired_order = [
+        "Combined worst-case",
+        "Baseline",
+        "Combined best-case",
+        "Aspirational best-case pathway",
+    ]
+
+    df["scenario"] = pd.Categorical(
+        df["scenario"],
+        categories=desired_order,
+        ordered=True,
+    )
+    df = df.sort_values("scenario").reset_index(drop=True)
+
+    labels = [
+        l.replace("Combined ", "Combined\n")
+         .replace("Aspirational ", "Aspirational\n")
+         .replace(" pathway", "\npathway")
+        for l in df["scenario"].tolist()
+    ]
+    values = df["net_carbon_balance_kgco2e"].to_numpy()
+
+    fig, ax = plt.subplots()
+    ax.bar(labels, values)
+    ax.set_xlabel("Scenario", fontsize=TITLE_FONT_SIZE)
+    ax.set_ylabel("Net carbon balance (kgCO2e per functional unit)", fontsize=TITLE_FONT_SIZE)
+    ax.set_title(title, fontsize=TITLE_FONT_SIZE)
+
+    ymin = min(values)
+    ymax = max(values)
+    ax.set_ylim(ymin - 0.1, max(0.1, ymax + 0.05))
+    ax.set_yticks(np.arange(round(ymin, 1), 0.2, 0.2))
+    ax.axhline(0, linewidth=0.8)
+
+    return _finish_plot(fig, filename, show)
+
+
+
+def plot_phase_1_tonne_year(
+    temporal_df: pd.DataFrame,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "phase_1_tonne_year.png",
+) -> Optional[Path]:
+    df = temporal_df.copy()
+    df = df[df["pathway_code"].isin(get_group_codes("phase_1"))]
+
+    if df.empty:
+        return None
+
+    labels = df["pathway_label"].tolist()
+    values = df["temporal_storage_benefit_tco2e_year"].to_numpy()
+
+    fig, ax = plt.subplots()
+    x = np.arange(len(labels))
+    ax.bar(x, values, width=0.16)
+
+    ax.set_xlabel("Pathway")
+    ax.set_ylabel("Temporal storage benefit (tCO2·year)")
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=25, ha="right")
+    ax.axhline(0, linewidth=0.8)
+
+    return _finish_plot(fig, filename, show)
+
+
+def plot_phase_2_stage_breakdown(
+    stage_split_df: pd.DataFrame,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "phase_2_stage_breakdown.png",
+) -> Optional[Path]:
+    df = stage_split_df.copy()
+    if df.empty:
+        return None
+
+    df["stage_parent"] = df["stage_code"].str[0]
+    value_cols = [c for c in df.columns if c not in {"stage_code", "stage_label", "stage_parent"}]
+    df = df.groupby("stage_parent", as_index=False)[value_cols].sum()
+
+    ordered_cols = [
+        "Baseline | Process emissions",
+        "Baseline | Biogenic release",
+        "Limited decarbonization | Process emissions",
+        "Limited decarbonization | Biogenic release",
+        "Medium decarbonization | Process emissions",
+        "Medium decarbonization | Biogenic release",
+        "High decarbonization | Process emissions",
+        "High decarbonization | Biogenic release",
+        "Maximum decarbonization | Process emissions",
+        "Maximum decarbonization | Biogenic release",
+    ]
+
+    series = [
+        (c, df[c].fillna(0.0).to_numpy())
+        for c in ordered_cols
+        if c in df.columns
+    ]
+
+    colors = {
+        "Baseline | Process emissions": "#9e9e9e",
+        "Baseline | Biogenic release": "#d9d9d9",
+        "Limited decarbonization | Process emissions": "#c62828",
+        "Limited decarbonization | Biogenic release": "#ef9a9a",
+        "Medium decarbonization | Process emissions": "#ff8f00",
+        "Medium decarbonization | Biogenic release": "#ffd54f",
+        "High decarbonization | Process emissions": "#2563eb",
+        "High decarbonization | Biogenic release": "#93c5fd",
+        "Maximum decarbonization | Process emissions": "#2e7d32",
+        "Maximum decarbonization | Biogenic release": "#81c784",
+    }
+
+    return _grouped(
+        df["stage_parent"].tolist(),
+        series,
+        title=title,
+        xlabel="Stage",
+        ylabel="kgCO2e per functional unit",
+        width=0.10,
+        filename=filename,
+        show=show,
+        colors=colors,
+    )
+
+
+def plot_phase_2_net_balance(
+    summary_df: pd.DataFrame,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "phase_2_net_balance.png",
+) -> Optional[Path]:
+    df = summary_df.copy()
+    df = df[df["pathway_code"].isin([
+        "A-B1-D2-E1",
+        "A-B2-D2-E2",
+        "A-B2-D3-E2",
+        "A-B3-D3-E2",
+        "A-B3-D3-E3",
+    ])]
+
+    if df.empty:
+        return None
+
+    labels = df["pathway_label"].tolist()
+    values = df["net_carbon_balance_kgco2e"].to_numpy()
+    colors = ["#d62728" if v < 0 else "#4c72b0" for v in values]
+
+    fig, ax = plt.subplots()
+    y = np.arange(len(labels))
+
+    bars = ax.barh(y, values, color=colors)
+    xmin = values.min()
+    xmax = values.max()
+    padding = (xmax - xmin) * 0.2 if xmax != xmin else 0.2
+
+    ax.set_xlim(xmin - padding, xmax + padding)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Net carbon balance (kgCO2e per functional unit)", fontsize=TITLE_FONT_SIZE)
+    ax.set_ylabel("Pathway", fontsize=TITLE_FONT_SIZE)
+    ax.set_title(title, fontsize=TITLE_FONT_SIZE)
+    ax.axvline(0, linewidth=0.8)
+
+    for bar, value in zip(bars, values):
+        ax.text(
+            value + (0.01 if value >= 0 else -0.01),
+            bar.get_y() + bar.get_height() / 2,
+            f"{value:.3f}",
+            va="center",
+            ha="left" if value >= 0 else "right",
+            fontsize=ANNOTATION_FONT_SIZE,
+        )
+
+    return _finish_plot(fig, filename, show)
+
+
+def plot_phase_2_tonne_year(
+    temporal_df: pd.DataFrame,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "phase_2_tonne_year.png",
+) -> Optional[Path]:
+    df = temporal_df.copy()
+    df = df[df["pathway_code"].isin([
+        "A-B1-D2-E1",
+        "A-B2-D2-E2",
+        "A-B2-D3-E2",
+        "A-B3-D3-E2",
+        "A-B3-D3-E3",
+    ])]
+
+    if df.empty:
+        return None
+
+    return _bar(
+        df["pathway_label"].tolist(),
+        df["temporal_storage_benefit_tco2e_year"].to_numpy(),
+        title=title,
+        xlabel="Pathway",
+        ylabel="Temporal storage benefit (tCO2·year)",
+        rotation=25,
+        ha="right",
+        filename=filename,
+        show=show,
+    )
+
+def plot_baseline_vs_max_difference(
+    df: pd.DataFrame,
+    *,
+    title: str,
+    show: bool = True,
+    filename: str = "baseline_vs_max_difference.png",
+) -> Optional[Path]:
+    if df.empty:
+        return None
+
+    plot_df = df.copy()
+    labels = plot_df["metric"].tolist()
+    values = plot_df["difference"].to_numpy()
+
+    fig, ax = plt.subplots(figsize=(10.5, 7.0))
+    y = np.arange(len(labels))
+
+    bars = ax.barh(y, values, height=0.35)
+
+    min_val = float(np.min(values))
+    max_val = float(np.max(values))
+    span = max_val - min_val
+    padding = max(0.1, 0.15 * span if span > 0 else 0.15 * abs(max_val) if max_val != 0 else 0.1)
+    ax.set_xlim(min_val - padding, max_val + padding)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels)
+    ax.set_xlabel("Difference (kg CO2e per functional unit)")
+    ax.set_title(title)
+    ax.axvline(0, color="black", linewidth=0.8)
+
+    for i, v in enumerate(values):
+        ax.text(
+            v + (0.02 if v >= 0 else -0.02),
+            i,
+            f"{v:.3f}",
+            va="center",
+            ha="left" if v >= 0 else "right",
+            fontsize=ANNOTATION_FONT_SIZE,
+        )
+
+    for bar in bars:
+        bar.set_edgecolor("none")
+
+    return _finish_plot(fig, filename, show)
+
+
+def plot_chart(
+    chart_id: str,
+    outputs: Dict[str, pd.DataFrame],
+    show: bool = True,
+    max_decarb_sensitivity_results: Optional[Dict[str, pd.DataFrame]] = None,
+    max_decarb_tornado_df: Optional[pd.DataFrame] = None,
+    constants: ModelConstants = C,
+) -> Optional[Path]:
+    spec = CHART_SPECS[chart_id]
+    title, filename = spec["title"], spec["filename"]
+
+    if chart_id == "baseline_stage_contribution":
+        return plot_baseline_stage_contribution(outputs["baseline_stage_contribution"], outputs["summary"], title=title, show=show, filename=filename)
+
+    elif chart_id == "tornado":
+        return _tornado(outputs["tornado"], title=title, filename=filename, show=show)
+
+    elif chart_id == "phase_1_summary":
+        return _phase_1_summary(outputs["phase_1_summary"], title=title, filename=filename, show=show)
+
+    elif chart_id == "phase_1_tonne_year":
+        return plot_phase_1_tonne_year(outputs["temporal_summary"], title=title, show=show, filename=filename)
+
+    elif chart_id == "phase_2_stage_breakdown":
+        return plot_phase_2_stage_breakdown(outputs["phase_2_stage_split_pivot"], title=title, show=show, filename=filename)
+
+    elif chart_id == "phase_2_net_balance":
+        return plot_phase_2_net_balance(outputs["summary"], title=title, show=show, filename=filename)
+
+    elif chart_id == "phase_2_tonne_year":
+        return plot_phase_2_tonne_year(outputs["temporal_summary"], title=title, show=show, filename=filename)
+
+    elif chart_id == "biochar_tipping_point":
+        tipping_data = outputs.get("biochar_tipping_analysis")
+        if tipping_data is None:
+            return None
+        tipping_point = outputs.get("tipping_point_fraction")
+        return plot_biochar_tipping_point(tipping_data, tipping_point, title=title, filename=filename, show=show)
+
+    elif chart_id == "baseline_to_max_waterfall":
+        return plot_baseline_to_max_waterfall(df=outputs["baseline_to_max_waterfall"], title=title, show=show, filename=filename)
+
+    elif chart_id == "max_decarb_sensitivity":
+        return plot_max_decarb_sensitivity_chart(constants=constants, sensitivity_results=max_decarb_sensitivity_results, title=title, show=show, filename=filename)
+
+    elif chart_id == "max_decarb_tornado":
+        return plot_max_decarb_tornado(constants=constants, tornado_df=max_decarb_tornado_df, title=title, show=show, filename=filename)
+
+    elif chart_id == "baseline_vs_max_difference":
+        return plot_baseline_vs_max_difference(outputs["baseline_vs_max_difference"], title=title, show=show, filename=filename)
+
+    elif chart_id == "uncertainty_vs_aspirational":
+        return plot_uncertainty_vs_aspirational(outputs["uncertainty"], outputs["aspirational_best_case"], title=title, show=show, filename=filename)
+
+    elif chart_id == "feasibility_impact_matrix":
+        return plot_feasibility_impact_matrix(title=title, show=show, filename=filename)
+    
+    else:
+        raise ValueError(f"Unknown chart_id '{chart_id}'.")
+
+
+def generate_figures(
+    outputs: Dict[str, pd.DataFrame],
+    chart_ids: Optional[List[str]] = None,
+    show: bool = True,
+    max_decarb_sensitivity_results: Optional[Dict[str, pd.DataFrame]] = None,
+    max_decarb_tornado_df: Optional[pd.DataFrame] = None,
+    constants: ModelConstants = C,
+) -> List[Dict[str, Any]]:
+    ids = chart_ids or list(CHART_SPECS)
+    print_chart_titles(ids)
+
+    exported = []
+    for chart_id in ids:
+        saved_path = plot_chart(
+            chart_id,
+            outputs,
+            show=show,
+            max_decarb_sensitivity_results=max_decarb_sensitivity_results,
+            max_decarb_tornado_df=max_decarb_tornado_df,
+            constants=constants,
+        )
+        exported.append(
+            {
+                "chart_id": chart_id,
+                "title": CHART_SPECS[chart_id]["title"],
+                "filename": CHART_SPECS[chart_id]["filename"],
+                "saved_path": str(saved_path) if saved_path is not None else None,
+            }
+        )
+
+    if SAVE_PLOTS:
+        print("\nEXPORTED FIGURES")
+        print("================")
+        for item in exported:
+            print(f"{item['chart_id']}: {item['saved_path']}")
+
+    return exported
+
+def plot_feasibility_impact_matrix(
+    *,
+    title: str = "Feasibility-Impact Matrix: Prioritising Decarbonization Levers",
+    show: bool = True,
+    filename: str = "feasibility_impact_matrix.png",
+) -> Optional[Path]:
+    """
+    Create a 2x2 matrix showing quantified impact vs feasibility for each decarbonization lever.
+    """
+
+    levers = [
+        {"name": "Grid decarbonization", "feasibility": 7, "impact": 9, "x_offset": 12, "y_offset": -10},
+        {"name": "On-site PV", "feasibility": 6, "impact": 9,"x_offset": -35, "y_offset": 10},
+        {"name": "Industrial biochar\ntechnology", "feasibility": 4, "impact": 10, "x_offset": 10, "y_offset": -18},
+        {"name": "Lignin resin", "feasibility": 2, "impact": 4, "x_offset": 0, "y_offset": -15},
+        {"name": "EV infrastructure", "feasibility": 9, "impact": 9, "x_offset": 10, "y_offset": -5},
+        {"name": "Carbon price", "feasibility": 3, "impact": 10, "x_offset": -30, "y_offset": 5},
+        {"name": "Material maintenance\n(D3 retention)", "feasibility": 6, "impact": 8, "x_offset": -40, "y_offset": -10},
+        {"name": "On-site bioenergy\nsubstitution", "feasibility": 8, "impact": 2, "x_offset": 10, "y_offset": -10},
+    ]
+
+    fig, ax = plt.subplots(figsize=(10.5, 7.0))
+
+    for lever in levers:
+        ax.scatter(
+            lever["feasibility"],
+            lever["impact"],
+            s=600,
+            alpha=0.7,
+            edgecolor="black",
+            linewidth=1.5,
+            zorder=5,
+        )
+
+    for lever in levers:
+        ax.annotate(
+            lever["name"],
+            xy=(lever["feasibility"], lever["impact"]),
+            xytext=(lever["x_offset"], lever["y_offset"]),
+            textcoords="offset points",
+            fontsize=ANNOTATION_FONT_SIZE,
+            fontweight="bold",
+            ha="center",
+            va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85, edgecolor="gray"),
+            zorder=10,
+        )
+
+    ax.axvline(x=5, color="gray", linestyle="--", linewidth=1.5, alpha=0.6, zorder=1)
+    ax.axhline(y=5, color="gray", linestyle="--", linewidth=1.5, alpha=0.6, zorder=1)
+
+    quadrant_labels = [
+        (7.5, 8.0, "QUICK WINS", "High Feasibility, High Impact", "lightgreen"),
+        (2.5, 8.0, "STRATEGIC PRIORITIES", "Low Feasibility, High Impact", "lightcoral"),
+        (7.5, 3.0, "LOW-HANGING FRUIT", "High Feasibility, Low Impact", "lightyellow"),
+        (2.5, 3.0, "LONG-TERM INVESTMENTS", "Low Feasibility, Low Impact", "lightgray"),
+    ]
+
+    for x, y, quadrant_title, subtitle, color in quadrant_labels:
+        ax.text(
+            x,
+            y,
+            f"{quadrant_title}\n({subtitle})",
+            ha="center",
+            va="center",
+            fontsize=ANNOTATION_FONT_SIZE,
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor=color, alpha=0.4),
+            zorder=1,
+        )
+
+    ax.set_xlim(0, 11)
+    ax.set_ylim(0, 11)
+    ax.set_xticks(np.arange(1, 11, 1))
+    ax.set_yticks(np.arange(1, 11, 1))
+    ax.set_xlabel("Feasibility (1 = Very Low, 10 = Very High)", fontweight="medium")
+    ax.set_ylabel("Impact on Net Carbon Balance (1 = Low, 10 = High)", fontweight="medium")
+    ax.set_title(title, fontweight="bold", pad=20)
+    ax.grid(True, alpha=0.3, linestyle="--", zorder=0)
+    ax.set_axisbelow(True)
+
+    return _finish_plot(fig, filename, show)
+
+
+
+# =========================================================
+# BLOCK 8 — ECONOMIC COMPARISON AT END-OF-LIFE AFTER D3
+# Developer chooses:
+#   E2 = sell wastewood feedstock to SAF supplier
+#   E3 = sell wastewood feedstock to biochar producer
+# =========================================================
+
+@dataclass(frozen=True)
+class EconomicAssumptions:
+    e2_pathway_code: str = "A-B3-D3-E2"
+    e3_pathway_code: str = "A-B3-D3-E3"
+
+    # Shared D3 transaction cost for developer
+    collection_logistics_cost_usd_per_kg_feed: float = 0.025  # 0.015 + 0.010
+
+    # Feedstock sale prices received by developer
+    e2_feedstock_sale_price_usd_per_kg_feed: float = 0.080
+    e3_feedstock_sale_price_usd_per_kg_feed: float = 0.050
+
+    # Optional E3 carbon-credit sharing
+    carbon_credit_price_usd_per_tco2e: float = 135.0
+    developer_share_of_e3_credit_revenue: float = 0.30
+    e3_credit_transaction_cost_usd_per_kgco2e: float = 0.005
+
+    @property
+    def carbon_credit_price_usd_per_kgco2e(self) -> float:
+        return self.carbon_credit_price_usd_per_tco2e / 1000.0
+
+def _co2e_stock_to_dry_bamboo_mass(
+    retained_stock_kgco2e: float,
+    c: ModelConstants = C
+) -> float:
+    denom = c.carbon_fraction_bamboo_dry * c.co2_to_c_molecular_ratio
+    if denom <= 0:
+        raise ValueError("Invalid constants for CO2e-to-dry-mass conversion.")
+    return retained_stock_kgco2e / denom
+
+
+def _get_required_stage(result: PathwayResult, stage_code: str) -> StageRecord:
+    stage = result.get_stage(stage_code)
+    if stage is None:
+        raise KeyError(f"Pathway '{result.pathway_code}' does not contain stage '{stage_code}'.")
+    return stage
+
+
+def _per_tonne_product(value_per_fu: float, c: ModelConstants = C) -> float:
+    if c.functional_unit_kg <= 0:
+        raise ValueError("functional_unit_kg must be > 0.")
+    return value_per_fu * (1000.0 / c.functional_unit_kg)
+
+
+def _per_m3_product(value_per_fu: float, c: ModelConstants = C) -> float:
+    if c.density_kg_per_m3 <= 0:
+        raise ValueError("density_kg_per_m3 must be > 0.")
+    return value_per_fu * (c.density_kg_per_m3 / c.functional_unit_kg)
+
+
+def compare_e2_e3_economics(
+    results: Dict[str, PathwayResult],
+    assumptions: EconomicAssumptions = EconomicAssumptions(),
+    constants: ModelConstants = C,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Developer-side choice at D3:
+      E2: sell feedstock to SAF supplier
+      E3: sell feedstock to biochar producer
+
+    This is a simple transaction model, not a plant-level TEA.
+    """
+
+    e2_result = results[assumptions.e2_pathway_code]
+    e3_result = results[assumptions.e3_pathway_code]
+
+    d3_e2 = _get_required_stage(e2_result, "D3")
+    d3_e3 = _get_required_stage(e3_result, "D3")
+    e3_stage = _get_required_stage(e3_result, "E3")
+
+    # Pathway-specific physical basis at the D3 end-of-service decision point
+    entering_stock_e2_kgco2e = d3_e2.retained_stock_kgco2e
+    entering_stock_e3_kgco2e = d3_e3.retained_stock_kgco2e
+
+    feed_mass_e2_kg = _co2e_stock_to_dry_bamboo_mass(entering_stock_e2_kgco2e, constants)
+    feed_mass_e3_kg = _co2e_stock_to_dry_bamboo_mass(entering_stock_e3_kgco2e, constants)
+
+    shared_cost_e2_usd_per_fu = feed_mass_e2_kg * assumptions.collection_logistics_cost_usd_per_kg_feed
+    shared_cost_e3_usd_per_fu = feed_mass_e3_kg * assumptions.collection_logistics_cost_usd_per_kg_feed
+    
+    # -----------------------------
+    # E2: feedstock sale only
+    # -----------------------------
+    e2_revenue_usd_per_fu = feed_mass_e2_kg * assumptions.e2_feedstock_sale_price_usd_per_kg_feed
+    e2_net_usd_per_fu = e2_revenue_usd_per_fu - shared_cost_e2_usd_per_fu
+
+    # -----------------------------
+    # E3: feedstock sale + optional shared carbon value
+    # -----------------------------
+    e3_feedstock_revenue_usd_per_fu = feed_mass_e3_kg * assumptions.e3_feedstock_sale_price_usd_per_kg_feed
+    retained_co2e_e3_kg = e3_stage.retained_stock_kgco2e
+
+    e3_credit_gross_usd_per_fu = (
+        retained_co2e_e3_kg
+        * assumptions.carbon_credit_price_usd_per_kgco2e
+        * assumptions.developer_share_of_e3_credit_revenue
+    )
+
+    e3_credit_transaction_cost_usd_per_fu = (
+        retained_co2e_e3_kg
+        * assumptions.e3_credit_transaction_cost_usd_per_kgco2e
+        * assumptions.developer_share_of_e3_credit_revenue
+    )
+
+    e3_net_usd_per_fu = (
+        e3_feedstock_revenue_usd_per_fu
+        + e3_credit_gross_usd_per_fu
+        - shared_cost_e3_usd_per_fu
+        - e3_credit_transaction_cost_usd_per_fu
+    )
+
+    # -----------------------------
+    # Break-even metrics
+    # -----------------------------
+    credit_margin_usd_per_fu_if_share_100 = (
+        retained_co2e_e3_kg
+        * (
+            assumptions.carbon_credit_price_usd_per_kgco2e
+            - assumptions.e3_credit_transaction_cost_usd_per_kgco2e
+        )
+    )
+
+    e3_feedstock_only_net_usd_per_fu = e3_feedstock_revenue_usd_per_fu - shared_cost_e3_usd_per_fu
+
+    if credit_margin_usd_per_fu_if_share_100 > 0:
+        breakeven_developer_credit_share = (
+            (e2_net_usd_per_fu - e3_feedstock_only_net_usd_per_fu)
+            / credit_margin_usd_per_fu_if_share_100
+        )
+    else:
+        breakeven_developer_credit_share = np.nan
+
+    if retained_co2e_e3_kg > 0 and assumptions.developer_share_of_e3_credit_revenue > 0:
+        breakeven_carbon_price_usd_per_kgco2e = (
+            (e2_net_usd_per_fu - e3_feedstock_only_net_usd_per_fu)
+            / (retained_co2e_e3_kg * assumptions.developer_share_of_e3_credit_revenue)
+        ) + assumptions.e3_credit_transaction_cost_usd_per_kgco2e
+    else:
+        breakeven_carbon_price_usd_per_kgco2e = np.nan
+
+    breakeven_carbon_price_usd_per_tco2e = (
+        breakeven_carbon_price_usd_per_kgco2e * 1000.0
+        if pd.notna(breakeven_carbon_price_usd_per_kgco2e)
+        else np.nan
+    )
+
+    assumptions_df = pd.DataFrame([
+        {"parameter": "e2_pathway_code", "value": assumptions.e2_pathway_code},
+        {"parameter": "e3_pathway_code", "value": assumptions.e3_pathway_code},
+        {"parameter": "collection_logistics_cost_usd_per_kg_feed", "value": assumptions.collection_logistics_cost_usd_per_kg_feed},
+        {"parameter": "e2_feedstock_sale_price_usd_per_kg_feed", "value": assumptions.e2_feedstock_sale_price_usd_per_kg_feed},
+        {"parameter": "e3_feedstock_sale_price_usd_per_kg_feed", "value": assumptions.e3_feedstock_sale_price_usd_per_kg_feed},
+        {"parameter": "carbon_credit_price_usd_per_tco2e", "value": assumptions.carbon_credit_price_usd_per_tco2e},
+        {"parameter": "developer_share_of_e3_credit_revenue", "value": assumptions.developer_share_of_e3_credit_revenue},
+        {"parameter": "e3_credit_transaction_cost_usd_per_kgco2e", "value": assumptions.e3_credit_transaction_cost_usd_per_kgco2e},
+    ])
+
+    physical_df = pd.DataFrame([
+        {"metric": "E2 entering D3 stock before Stage E", "unit": "kgCO2e per FU", "value": entering_stock_e2_kgco2e},
+        {"metric": "E3 entering D3 stock before Stage E", "unit": "kgCO2e per FU", "value": entering_stock_e3_kgco2e},
+        {"metric": "E2 equivalent dry bamboo feedstock after D3", "unit": "kg dry feed per FU", "value": feed_mass_e2_kg},
+        {"metric": "E3 equivalent dry bamboo feedstock after D3", "unit": "kg dry feed per FU", "value": feed_mass_e3_kg},
+        {"metric": "E3 retained CO2e monetised downstream", "unit": "kgCO2e per FU", "value": retained_co2e_e3_kg},
+    ])
+
+    pathway_comparison_df = pd.DataFrame([
+        {
+            "pathway": "E2 -> sell to SAF supplier",
+            "pathway_code": assumptions.e2_pathway_code,
+            "feedstock_revenue_usd_per_fu": e2_revenue_usd_per_fu,
+            "shared_credit_revenue_usd_per_fu": 0.0,
+            "total_cost_usd_per_fu": shared_cost_e2_usd_per_fu,
+            "net_revenue_usd_per_fu": e2_net_usd_per_fu,
+            "net_revenue_usd_per_t_product": _per_tonne_product(e2_net_usd_per_fu, constants),
+            "net_revenue_usd_per_m3_product": _per_m3_product(e2_net_usd_per_fu, constants),
+        },
+        {
+            "pathway": "E3 -> sell to biochar producer",
+            "pathway_code": assumptions.e3_pathway_code,
+            "feedstock_revenue_usd_per_fu": e3_feedstock_revenue_usd_per_fu,
+            "shared_credit_revenue_usd_per_fu": e3_credit_gross_usd_per_fu,
+            "total_cost_usd_per_fu": shared_cost_e3_usd_per_fu + e3_credit_transaction_cost_usd_per_fu,
+            "net_revenue_usd_per_fu": e3_net_usd_per_fu,
+            "net_revenue_usd_per_t_product": _per_tonne_product(e3_net_usd_per_fu, constants),
+            "net_revenue_usd_per_m3_product": _per_m3_product(e3_net_usd_per_fu, constants),
+        },
+    ])
+
+    crossover_df = pd.DataFrame([
+        {
+            "metric": "Net advantage of E2 over E3",
+            "unit": "USD/FU",
+            "value": e2_net_usd_per_fu - e3_net_usd_per_fu,
+        },
+        {
+            "metric": "Net advantage of E2 over E3",
+            "unit": "USD/t product",
+            "value": _per_tonne_product(e2_net_usd_per_fu - e3_net_usd_per_fu, constants),
+        },
+        {
+            "metric": "Break-even developer share of E3 carbon-credit value",
+            "unit": "fraction",
+            "value": breakeven_developer_credit_share,
+        },
+        {
+            "metric": "Break-even carbon price for E3 to match E2",
+            "unit": "USD/kgCO2e",
+            "value": breakeven_carbon_price_usd_per_kgco2e,
+        },
+        {
+            "metric": "Break-even carbon price for E3 to match E2",
+            "unit": "USD/tCO2e",
+            "value": breakeven_carbon_price_usd_per_tco2e,
+        },
+    ])
+
+    for df in (assumptions_df, physical_df, pathway_comparison_df, crossover_df):
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        for col in numeric_cols:
+            df[col] = df[col].map(lambda x: round_value(x, 4))
+
+    return {
+        "economic_assumptions": assumptions_df,
+        "economic_physical_basis": physical_df,
+        "economic_pathway_comparison": pathway_comparison_df,
+        "economic_crossover": crossover_df,
+    }
+
+
+# =========================================================
+# BLOCK 9 — ORCHESTRATION AND MAIN
+# =========================================================
+
+def print_core_outputs(outputs: Dict[str, pd.DataFrame]) -> None:
+    for title, key in (
+        ("SUMMARY TABLE", "summary"),
+        ("TEMPORAL STORAGE SUMMARY", "temporal_summary"),
+        ("SENSITIVITY RESULTS", "sensitivity"),
+        ("UNCERTAINTY ENVELOPE", "uncertainty"),
+        ("BASELINE VS MAXIMUM DECARBONIZATION", "baseline_vs_max_difference"),
+    ):
+        df = outputs.get(key, pd.DataFrame())
+        if df is None or df.empty:
+            continue
+
+        if key == "baseline_vs_max_difference":
+            df = df.copy()
+            df["metric"] = df["metric"].str.replace("Δ", "", regex=False)
+
+            numeric_cols = df.select_dtypes(include="number").columns
+            df[numeric_cols] = df[numeric_cols].round(3)
+
+            df = df.rename(columns={
+                "baseline": "Baseline",
+                "max_decarb": "Maximum Decarbonization",
+                "difference": "Max − Baseline",
+            })
+
+        print_section_title(title)
+        print(df.to_string(index=False))
+
+
+def build_model_outputs(
+    constants: ModelConstants = C,
+    horizon_years: float = DEFAULT_TIME_HORIZON_YEARS,
+    delta: float = DEFAULT_SENSITIVITY_DELTA,
+) -> Tuple[Dict[str, PathwayResult], Dict[str, pd.DataFrame]]:
+    results = run_all_pathways(constants)
+    outputs = build_outputs(
+        results,
+        constants=constants,
+        horizon_years=horizon_years,
+        delta=delta,
+    )
+    return results, outputs
+
+
+def export_outputs(outputs: Dict[str, pd.DataFrame]) -> None:
+    export_package(outputs)
+
+
+def build_feasibility_matrix(constants: ModelConstants = C) -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "Lever": "Grid decarbonization",
+            "Parameter": "electricity_kgco2e_per_kwh",
+            "Min": 0.1333,
+            "Base": constants.electricity_kgco2e_per_kwh,
+            "Max": 0.6796,
+            "Feasibility": "High",
+            "Scalability": "Medium",
+        },
+        {
+            "Lever": "On-site PV",
+            "Parameter": "pv_substitution_share",
+            "Min": 0.00,
+            "Base": constants.pv_substitution_share,
+            "Max": 0.80,
+            "Feasibility": "Medium",
+            "Scalability": "High",
+        },
+        {
+            "Lever": "Biochar technology",
+            "Parameter": "biochar_retention_e3",
+            "Min": 0.30,
+            "Base": constants.biochar_retention_e3,
+            "Max": 0.70,
+            "Feasibility": "Low",
+            "Scalability": "Low",
+        },
+        {
+            "Lever": "Lignin resin",
+            "Parameter": "lignin_substitution_rate",
+            "Min": 0.80,
+            "Base": constants.lignin_substitution_rate,
+            "Max": 1.00,
+            "Feasibility": "Medium",
+            "Scalability": "High",
+        },
+        {
+            "Lever": "EV infrastructure",
+            "Parameter": "transport_emissions_multiplier",
+            "Min": 0.60,
+            "Base": 1.0,
+            "Max": 1.40,
+            "Feasibility": "Medium",
+            "Scalability": "Medium",
+        },
+        {
+            "Lever": "Manufacturing efficiency",
+            "Parameter": "manufacturing_energy_multiplier",
+            "Min": 0.70,
+            "Base": 1.0,
+            "Max": 1.30,
+            "Feasibility": "High",
+            "Scalability": "High",
+        },
+        {
+            "Lever": "D3 maintenance",
+            "Parameter": "d3_target_retention_fraction_at_year50",
+            "Min": 0.60,
+            "Base": constants.d3_target_retention_fraction_at_year50,
+            "Max": 0.85,
+            "Feasibility": "Medium",
+            "Scalability": "Medium",
+        },
+    ])
+
+
+def main(
+    constants: ModelConstants = C,
+    horizon_years: float = DEFAULT_TIME_HORIZON_YEARS,
+    delta: float = DEFAULT_SENSITIVITY_DELTA,
+    show_plots: bool = True,
+) -> Dict[str, Any]:
+    results, outputs = build_model_outputs(
+        constants=constants,
+        horizon_years=horizon_years,
+        delta=delta,
+    )
+
+    if PRINT_SUMMARY_TABLES:
+        print_core_outputs(outputs)
+
+    if EXPORT_RESULTS:
+        export_outputs(outputs)
+
+    feasibility_data = build_feasibility_matrix(constants)
+
+    if EXPORT_RESULTS:
+        feasibility_data.to_csv(TABLE_DIR / "feasibility_matrix.csv", index=False)
+
+    economic_results = compare_e2_e3_economics(results, constants=constants)
+
+    if PRINT_SUMMARY_TABLES:
+        print_section_title("ECONOMIC COMPARISON: E2 vs E3")
+        for key, df in economic_results.items():
+            print(f"\n--- {key} ---")
+            print(df.to_string())
+
+    if EXPORT_RESULTS:
+        for key, df in economic_results.items():
+            export_table(df, f"{key}.csv")
+
+    if GENERATE_PLOTS:
+        evaluated_max_decarb = evaluate_max_decarb_parameters(constants)
+        max_decarb_sensitivity_results = {
+            name: payload["sweep_df"]
+            for name, payload in evaluated_max_decarb.items()
+        }
+        max_decarb_tornado_df = build_max_decarb_tornado_data(
+            constants,
+            evaluated=evaluated_max_decarb,
+        )
+
+        generate_figures(
+            outputs,
+            show=show_plots,
+            max_decarb_sensitivity_results=max_decarb_sensitivity_results,
+            max_decarb_tornado_df=max_decarb_tornado_df,
+            constants=constants,
+        )
+
+    return {
+        "constants": constants,
+        "results": results,
+        "outputs": outputs,
+        "feasibility_matrix": feasibility_data,
+        "economic_results": economic_results,
+        "chart_specs": CHART_SPECS,
+        "chart_title_map": get_chart_title_map(),
+    }
+
+
+if __name__ == "__main__":
+    main()
+
