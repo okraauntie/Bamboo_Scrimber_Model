@@ -165,7 +165,7 @@ class ModelConstants:
 
     # D3 Electric Vehicle Transport
     d3_ev_truck_kwh_per_km: float = 1.77  # Heavy EV truck
-    d3_ev_truck_payload_kg: float = 10000.0  # 10 tonnes
+    d3_ev_truck_payload_kg: float = 12000.0  # 12 tonnes
     zhejiang_grid_kgco2e_per_kwh: float = 0.4974  # Same as electricity_kgco2e_per_kwh
     d3_ev_charging_loss_factor: float = 1.00
 
@@ -633,7 +633,16 @@ D1_REFERENCE_YEAR_2 = 25.0
 D1_RETENTION_AT_YEAR_1 = 0.94
 D1_RETENTION_AT_YEAR_2 = 0.50
 
-
+def remaining_product_mass_from_stock(
+    retained_stock_kgco2e: float,
+    c: ModelConstants = C,
+) -> float:
+    initial_stock = calculate_initial_biogenic_stock(c)
+    if initial_stock <= 0:
+        return 0.0
+    retained_mass_fraction = retained_stock_kgco2e / initial_stock
+    return c.functional_unit_kg * retained_mass_fraction
+    
 def _make_stage(
     stage: str,
     *,
@@ -718,7 +727,10 @@ def _terminal_year(stage: StageRecord) -> float:
         return 25.0
     if stage.stage_code in {"D3", "E3"}:
         return 50.0
-    raise ValueError(f"Unsupported stage code for terminal year: {stage.stage_code}")
+    raise ValueError(
+        f"_terminal_year() only supports D-stage records (D1/D2/D3), "
+        f"got '{stage.stage_code}'."
+    )
 
 
 # -----------------------------
@@ -758,13 +770,16 @@ def continue_decay_from_stage_c_d1(carbon_at_year1: float, stage_d_duration_year
 
 
 def bamboo_decay_fraction_d3(year: float, retention_50y: float) -> float:
+    """
+    Linear decay from 100% retention at year 0
+    to retention_50y at year 50, independent of D1.
+    """
     if year < 0 or not (0 < retention_50y <= 1):
         raise ValueError("Invalid D3 decay inputs.")
-    retention_1y = bamboo_decay_fraction_d1(1.0)
-    if year <= 1.0:
-        return bamboo_decay_fraction_d1(year)
+
     if year <= 50.0:
-        return retention_1y + (retention_50y - retention_1y) * ((year - 1.0) / 49.0)
+        return 1.0 + (retention_50y - 1.0) * (year / 50.0)
+
     return retention_50y
 
 
@@ -782,26 +797,29 @@ def continue_decay_direct_d3(initial_stock: float, end_year: float, retention_50
 # Stage D1 (Relocation pathway - from Stage C)
 # -----------------------------
 
-def _relocation_transport(c: ModelConstants) -> float:
+def _relocation_transport(mass_kg: float, c: ModelConstants) -> float:
     return _sum(
-        transport_emissions(c.functional_unit_kg, c.osaka_expo_to_port_km, c.truck_kgco2e_per_tkm, c),
-        transport_emissions(c.functional_unit_kg, c.osaka_to_haikou_km, c.ship_kgco2e_per_tkm, c),
-        transport_emissions(c.functional_unit_kg, c.haikou_port_to_site_km, c.truck_kgco2e_per_tkm, c),
+        transport_emissions(mass_kg, c.osaka_expo_to_port_km, c.truck_kgco2e_per_tkm, c),
+        transport_emissions(mass_kg, c.osaka_to_haikou_km, c.ship_kgco2e_per_tkm, c),
+        transport_emissions(mass_kg, c.haikou_port_to_site_km, c.truck_kgco2e_per_tkm, c),
     )
 
 
 def calculate_stage_d1(stage_c: StageRecord, c: ModelConstants = C) -> StageRecord:
     start_stock = stage_c.retained_stock_kgco2e
-    process = _relocation_transport(c)
+    remaining_mass = remaining_product_mass_from_stock(start_stock, c)
+
+    process = _relocation_transport(remaining_mass, c)
     stock_end = continue_decay_from_stage_c_d1(start_stock, c.d1_secondary_service_life_years)
     release = start_stock - stock_end
+
     return _make_stage(
         "D1",
         process=process,
         release=release,
         stock_end=stock_end,
         stock_change=-release,
-        notes="Relocation from Osaka to Hainan + 24-year secondary service life in Hainan.",
+        notes="Relocation from Osaka to Hainan using remaining product mass after Stage C + 24-year secondary service life in Hainan.",
         transport=process,
         start_year=1.0,
         end_year=25.0,
@@ -812,30 +830,33 @@ def calculate_stage_d1(stage_c: StageRecord, c: ModelConstants = C) -> StageReco
 # Stage D2 (Direct deployment - from Stage A, 25-year life)
 # -----------------------------
 
-def _direct_transport(c: ModelConstants) -> float:
+def _direct_transport(mass_kg: float, c: ModelConstants) -> float:
     return _sum(
-        transport_emissions(c.functional_unit_kg, c.d23_truck1_distance_km, c.truck_kgco2e_per_tkm, c),
-        transport_emissions(c.functional_unit_kg, c.d23_ferry_distance_km, c.d23_ferry_kgco2e_per_tkm, c),
-        transport_emissions(c.functional_unit_kg, c.d23_truck2_distance_km, c.truck_kgco2e_per_tkm, c),
+        transport_emissions(mass_kg, c.d23_truck1_distance_km, c.truck_kgco2e_per_tkm, c),
+        transport_emissions(mass_kg, c.d23_ferry_distance_km, c.d23_ferry_kgco2e_per_tkm, c),
+        transport_emissions(mass_kg, c.d23_truck2_distance_km, c.truck_kgco2e_per_tkm, c),
     )
 
 
 def calculate_stage_d2(stage_a: StageRecord, c: ModelConstants = C) -> StageRecord:
     start_stock = stage_a.retained_stock_kgco2e
-    process = _direct_transport(c)
+    remaining_mass = remaining_product_mass_from_stock(start_stock, c)
+
+    process = _direct_transport(remaining_mass, c)
     stock_end = bamboo_decay_no_maintenance_remaining(
-        start_stock, 
-        c.d2_service_life_years, 
+        start_stock,
+        c.d2_service_life_years,
         c.d2_retention_at_year_25
     )
     release = start_stock - stock_end
+
     return _make_stage(
         "D2",
         process=process,
         release=release,
         stock_end=stock_end,
         stock_change=-release,
-        notes=f"Direct deployment from Zhejiang to Hainan + 25-year secondary service life with {c.d2_retention_at_year_25:.0%} retention at year 25.",
+        notes=f"Direct deployment from Zhejiang to Hainan using remaining product mass + 25-year secondary service life with {c.d2_retention_at_year_25:.0%} retention at year 25.",
         transport=process,
         start_year=0.0,
         end_year=25.0,
@@ -846,45 +867,44 @@ def calculate_stage_d2(stage_a: StageRecord, c: ModelConstants = C) -> StageReco
 # Stage D3 (Direct deployment - from Stage A, 50-year life) - WITH EV TRANSPORT
 # -----------------------------
 
-def _direct_transport_d3_ev(c: ModelConstants) -> float:
-    """EV transport for D3 with grid-specific emission factors"""
-    mass_tonnes = c.functional_unit_kg / 1000.0
-    
-    # Leg 1: Anji (Zhejiang) to port - using Zhejiang grid
+def _direct_transport_d3_ev(mass_kg: float, c: ModelConstants) -> float:
+    mass_tonnes = mass_kg / 1000.0
+
     tkm_leg1 = mass_tonnes * c.d23_truck1_distance_km
     vehicle_km_leg1 = tkm_leg1 / (c.d3_ev_truck_payload_kg / 1000.0)
     electricity_kwh_leg1 = vehicle_km_leg1 * c.d3_ev_truck_kwh_per_km * c.d3_ev_charging_loss_factor
     emissions_leg1 = electricity_kwh_leg1 * c.zhejiang_grid_kgco2e_per_kwh * c.transport_emissions_multiplier
-    
-    # Leg 2: Ferry (same as before - no EV change)
+
     emissions_leg2 = transport_emissions(
-        c.functional_unit_kg, 
-        c.d23_ferry_distance_km, 
+        mass_kg,
+        c.d23_ferry_distance_km,
         c.d23_ferry_kgco2e_per_tkm,
         c
     )
-    
-    # Leg 3: Haikou port to West Coast Belt Park - using Hainan grid
-    tkm_leg3 = mass_tonnes * c.d23_truck2_distance_km  
-    vehicle_km_leg3 = tkm_leg3 / (c.d3_ev_truck_payload_kg / 1000.0)  
+
+    tkm_leg3 = mass_tonnes * c.d23_truck2_distance_km
+    vehicle_km_leg3 = tkm_leg3 / (c.d3_ev_truck_payload_kg / 1000.0)
     electricity_kwh_leg3 = vehicle_km_leg3 * c.d3_ev_truck_kwh_per_km * c.d3_ev_charging_loss_factor
     emissions_leg3 = electricity_kwh_leg3 * c.hainan_grid_kgco2e_per_kwh * c.transport_emissions_multiplier
-    
+
     return emissions_leg1 + emissions_leg2 + emissions_leg3
 
 
 def calculate_stage_d3(stage_a: StageRecord, c: ModelConstants = C) -> StageRecord:
     start_stock = stage_a.retained_stock_kgco2e
-    process = _direct_transport_d3_ev(c) 
+    remaining_mass = remaining_product_mass_from_stock(start_stock, c)
+
+    process = _direct_transport_d3_ev(remaining_mass, c)
     stock_end = continue_decay_direct_d3(start_stock, c.d3_end_of_service_year, c.d3_target_retention_fraction_at_year50)
     release = start_stock - stock_end
+
     return _make_stage(
         "D3",
         process=process,
         release=release,
         stock_end=stock_end,
         stock_change=-release,
-        notes="Direct deployment from Zhejiang to Hainan + 50-year secondary service life with EV transport (Zhejiang grid to port, Hainan grid to park).",
+        notes="Direct deployment from Zhejiang to Hainan using remaining product mass + 50-year secondary service life with EV transport.",
         transport=process,
         start_year=0.0,
         end_year=50.0,
@@ -1077,38 +1097,79 @@ def calculate_stage_c1(stage_a: StageRecord, stage_c: StageRecord, c: ModelConst
 # Stage E1, E2, E3
 # -----------------------------
 
+def _end_of_life_ev_transport(mass_kg: float, c: ModelConstants = C) -> float:
+    electricity = (
+        c.west_coast_park_to_incinerator_km
+        * c.ev_heavy_lorry_kwh_per_km
+        * (mass_kg / c.heavy_lorry_payload_kg_e1)
+    )
+    return electricity * c.hainan_grid_kgco2e_per_kwh * c.transport_emissions_multiplier
+
+
 def calculate_stage_e1(stage_d: StageRecord, c: ModelConstants = C) -> StageRecord:
     entering = stage_d.retained_stock_kgco2e
-    electricity = c.west_coast_park_to_incinerator_km * c.ev_heavy_lorry_kwh_per_km * (c.functional_unit_kg / c.heavy_lorry_payload_kg_e1)
-    process = electricity * c.hainan_grid_kgco2e_per_kwh * c.transport_emissions_multiplier
+    remaining_mass = remaining_product_mass_from_stock(entering, c)
+    process = _end_of_life_ev_transport(remaining_mass, c)
     yr = _terminal_year(stage_d)
+
     return _make_stage(
         "E1",
         process=process,
         release=entering,
         stock_end=0.0,
         stock_change=-entering,
-        notes="Hainan transport + full incineration.",
+        notes="Hainan transport using remaining product mass + full incineration.",
         transport=process,
         start_year=yr,
         end_year=yr,
     )
 
 
-def _calculate_stage_biochar(stage: str, stage_d: StageRecord, retention: float, notes: str) -> StageRecord:
+def _calculate_stage_biochar(
+    stage: str,
+    stage_d: StageRecord,
+    retention: float,
+    notes: str,
+    c: ModelConstants = C,
+) -> StageRecord:
     entering = stage_d.retained_stock_kgco2e
+    remaining_mass = remaining_product_mass_from_stock(entering, c)
+    transport_process = _end_of_life_ev_transport(remaining_mass, c)
+
     stock_end = entering * retention
     release = entering - stock_end
     yr = 50.0 if stage == "E3" else _terminal_year(stage_d)
-    return _make_stage(stage, process=0.0, release=release, stock_end=stock_end, stock_change=-release, notes=notes, start_year=yr, end_year=yr)
 
+    return _make_stage(
+        stage,
+        process=transport_process,
+        release=release,
+        stock_end=stock_end,
+        stock_change=-release,
+        notes=notes,
+        transport=transport_process,
+        start_year=yr,
+        end_year=yr,
+    )
 
 def calculate_stage_e2(stage_d: StageRecord, c: ModelConstants = C) -> StageRecord:
-    return _calculate_stage_biochar("E2", stage_d, c.biochar_retention_e2, "Fast pyrolysis with fixed 15% biochar retention.")
+    return _calculate_stage_biochar(
+        "E2",
+        stage_d,
+        c.biochar_retention_e2,
+        "Hainan transport using remaining product mass + fast pyrolysis with fixed 15% biochar retention.",
+        c,
+    )
 
 
 def calculate_stage_e3(stage_d: StageRecord, c: ModelConstants = C) -> StageRecord:
-    return _calculate_stage_biochar("E3", stage_d, c.biochar_retention_e3, "Carbon storage maximisation via 70% biochar retention.")
+    return _calculate_stage_biochar(
+        "E3",
+        stage_d,
+        c.biochar_retention_e3,
+        "Hainan transport using remaining product mass + carbon storage maximisation via 70% biochar retention.",
+        c,
+    )
 
 
 D_STAGE_FUNCS = {
@@ -1167,7 +1228,7 @@ def run_pathway(pathway_code: str, c: ModelConstants = C) -> PathwayResult:
                 meta["d_stage"],
                 err_label="d",
                 pathway_code=pathway_code,
-                args=(c_stage, c),
+                args=(c_stage, c)
             )
             e = _run_stage(
                 E_STAGE_FUNCS,
@@ -1550,6 +1611,7 @@ def _baseline_sensitivity_result(
         d_stage,
         _clamp(biochar_fraction, 0.0, 1.0),
         "Counterfactual biochar-retention sensitivity case on baseline pathway.",
+        case,
     )
     adjusted_stages[-1] = adjusted_e2
 
@@ -1686,7 +1748,7 @@ def biochar_tipping_point_analysis(
     
     entering_stock = d3_stage.retained_stock_kgco2e
     
-    # Get process emissions (excluding E3 which has zero process emissions)
+    # Get process emissions (including end-of-life transport emissions in E2/E3)
     process_emissions = base_result.total_process_emissions_kgco2e
     
     # Initial biogenic stock
@@ -2125,7 +2187,7 @@ CHART_SPECS = {
     },
     "tornado": {
         "title": "Sensitivity analysis tornado chart",
-        "filename": "tornado_chart.png",
+        "filename": "baseline_tornado_chart.png",
     },
     "phase_1_summary": {
         "title": "Phase 1 scenario comparison: Japan disposal vs relocation",
@@ -2611,6 +2673,7 @@ def plot_max_decarb_tornado(
 
         if "grid carbon intensity" in row["parameter"].lower():
             provincial_grid_intensities = {
+                "Zhejiang": 0.4974,
                 "National avg": 0.6096,
                 "Yunnan": 0.1333,
                 "Tianjin": 0.6796,
@@ -2624,23 +2687,16 @@ def plot_max_decarb_tornado(
             max_delta = row["max_delta"]
 
             if max_val != min_val:
-                provincial_grid_intensities = {
-                    "National avg": 0.6096,
-                    "Yunnan": 0.1333,
-                    "Tianjin": 0.6796,
-                    "Guangdong": 0.4419,
-                    "Sichuan": 0.1564,
-                }
-
                 left_label_x = x_min + 0.16
                 right_label_x = x_max - 0.03
 
                 province_label_positions = {
-                    "Tianjin":      (left_label_x,  i - 0.30, "right"),
-                    "National avg": (left_label_x,  i + 0.28, "right"),
-                    "Guangdong":    (left_label_x,  i + 0.10, "right"),
-                    "Sichuan":      (right_label_x, - 0.02, i + 0.60, "right"),
-                    "Yunnan":       (right_label_x, i + 0.80, "right"),
+                    "Zhejiang":     (left_label_x +0.15,  i + 1.10, "right"),
+                    "Tianjin":      (left_label_x +0.15,  i - 0.30, "right"),
+                    "National avg": (left_label_x +0.15,  i + 0.70, "right"),
+                    "Guangdong":    (left_label_x +0.15,  i - 0.80, "right"),
+                    "Sichuan":      (right_label_x - 0.02, i - 0.90, "right"),
+                    "Yunnan":       (right_label_x, i - 0.60, "right"),
                 }
 
                 for province, grid_value in provincial_grid_intensities.items():
@@ -3557,6 +3613,7 @@ def compare_e2_e3_economics(
         "economic_pathway_comparison": pathway_comparison_df,
         "economic_crossover": crossover_df,
     }
+
 
 
 # =========================================================
